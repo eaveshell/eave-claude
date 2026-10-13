@@ -478,6 +478,40 @@ fn a_session_that_ends_takes_its_prompts_with_it() {
 }
 
 #[test]
+fn a_chat_that_shows_needs_no_notifications() {
+    let mut widget = claude();
+    let _ = widget.update(Message::Sessions(vec![
+        live("s", Status::Idle),
+        live("t", Status::Idle),
+    ]));
+    let stop = |session| {
+        Message::Hooks(hooks::Event::Hook(Box::new(hook(
+            session,
+            "Stop",
+            json!({"last_assistant_message": "Done."}),
+        ))))
+    };
+    // Already up when its chat opens: it goes away.
+    let _ = widget.update(stop("s"));
+    assert_eq!(widget.wanted().len(), 1);
+    let _ = widget.update(Message::Show(Page::Chat("s".into())));
+    let _ = widget.update(Message::Opened);
+    assert!(widget.wanted().is_empty());
+    // Asked or said while it shows: none, and none once it closes.
+    let _answer = ask(&mut widget, 10_015, "s", "Bash", json!({}));
+    assert!(widget.wanted().is_empty());
+    // The prompt is still there to answer, in the chat.
+    assert_eq!(widget.pending("s").map(|p| p.id), Some(10_015));
+    let _ = widget.update(stop("s"));
+    assert!(widget.wanted().is_empty());
+    // Another session still gets its own.
+    let _ = widget.update(stop("t"));
+    assert_eq!(widget.wanted().len(), 1);
+    let _ = widget.update(Message::Closed);
+    assert_eq!(widget.wanted().len(), 1, "only the other session's");
+}
+
+#[test]
 fn a_chat_follows_only_the_session_showing() {
     let mut widget = claude();
     let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
