@@ -18,6 +18,7 @@ fn live(id: &str, status: Status) -> sessions::Live {
         status,
         socket: Some(PathBuf::from("/run/user/1/cc-socks/4242.sock")),
         started: 1,
+        since: 1,
     }
 }
 
@@ -586,4 +587,39 @@ fn questions_come_one_at_a_time() {
         decision(&mut answer)["updatedInput"]["answers"],
         json!({"One?": "A", "Two?": "my own", "Three?": "F"})
     );
+}
+
+#[test]
+fn the_mascot_works_plans_asks_and_rests() {
+    let mut widget = claude();
+    let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
+    assert_eq!(widget.mood(), Mood::Laptop);
+
+    let plan = hook("s", "UserPromptSubmit", json!({"permission_mode": "plan"}));
+    let _ = widget.update(Message::Hooks(hooks::Event::Hook(Box::new(plan))));
+    assert_eq!(widget.mood(), Mood::Planning);
+
+    let _answer = ask(&mut widget, 10_030, "s", "Bash", json!({"command": "ls"}));
+    assert_eq!(widget.mood(), Mood::Question);
+    let _ = widget.update(Message::Deny(10_030));
+    assert_eq!(widget.mood(), Mood::Planning);
+
+    // Done a moment ago: pleased, until five minutes have gone by.
+    let now = Clock::now().now;
+    let mut done = live("s", Status::Idle);
+    done.since = now - 1000;
+    let _ = widget.update(Message::Sessions(vec![done.clone()]));
+    assert_eq!(widget.mood(), Mood::Happy);
+    assert_eq!(widget.next_change(), Some(done.since + mood::DONE_FOR));
+
+    // Not after a turn that failed.
+    let failed = hook("s", "StopFailure", json!({"error": "overloaded"}));
+    let _ = widget.update(Message::Hooks(hooks::Event::Hook(Box::new(failed))));
+    assert!(widget.mood().resting());
+
+    // Long idle: coffee or sleep, whichever the hour says.
+    done.since = 1;
+    let _ = widget.update(Message::Sessions(vec![done]));
+    assert!(widget.mood().resting());
+    assert!(widget.next_change().is_some_and(|at| at > now));
 }

@@ -13,13 +13,15 @@
 //! Notifications go over the session bus like any app's ([`notify`]).
 
 mod hooks;
+mod mascot;
+mod mood;
 mod notify;
 mod peer;
 mod sessions;
 mod title;
 mod transcript;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 
@@ -29,6 +31,7 @@ use eave_api::{Effect, Nudge, Registry, Subscription, Task, Widget};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use mood::{Clock, Facts, Mood};
 use sessions::Status;
 use transcript::{Chat, Entry};
 
@@ -74,6 +77,12 @@ pub struct Claude {
     /// Each session's permission mode before it went into plan mode, from its hooks: approving a
     /// plan goes back to it, as the terminal does.
     modes: HashMap<String, String>,
+    /// The sessions in plan mode, as their hooks last said.
+    planning: HashSet<String>,
+    /// The sessions whose last turn ended in an error.
+    failed_turns: HashSet<String>,
+    /// The time when the last message came: moods change with it.
+    clock: Clock,
     page: Page,
     /// What's being typed in the popover, and where it goes.
     draft: Option<(Target, String)>,
@@ -93,6 +102,10 @@ struct Session {
     socket: Option<PathBuf>,
     /// The end of its last turn.
     last_reply: Option<String>,
+    /// Milliseconds since the epoch.
+    started: u64,
+    /// When its status last changed, in milliseconds since the epoch.
+    since: u64,
 }
 
 struct Prompt {
@@ -220,6 +233,8 @@ pub enum Message {
     Unasked(String),
     Opened,
     Closed,
+    /// Time changed a session's mood: done a while ago, or night fell.
+    Tick,
 }
 
 impl Widget for Claude {
@@ -236,6 +251,9 @@ impl Widget for Claude {
             next_note: 1,
             posted: Vec::new(),
             modes: HashMap::new(),
+            planning: HashSet::new(),
+            failed_turns: HashSet::new(),
+            clock: Clock::now(),
             page: Page::Sessions,
             draft: None,
             open: false,
@@ -245,6 +263,7 @@ impl Widget for Claude {
     }
 
     fn update(&mut self, message: Message) -> Effect<Message> {
+        self.clock = Clock::now();
         let effect = self.handle(message);
         let post = self.post();
         effect.and_task(post)
@@ -272,6 +291,19 @@ impl Widget for Claude {
                 .map(|(id, chat)| Message::Chat(id, chat)),
             );
         }
+        // Wakes when time alone changes a mood, not before.
+        if let Some(at) = self.next_change() {
+            subscriptions.push(
+                Subscription::run_with(at, |at| {
+                    let at = *at;
+                    futures_util::stream::once(async move {
+                        let left = at.saturating_sub(Clock::now().now);
+                        sleep(Duration::from_millis(left)).await;
+                    })
+                })
+                .map(|()| Message::Tick),
+            );
+        }
         Subscription::batch(subscriptions)
     }
 
@@ -280,15 +312,17 @@ impl Widget for Claude {
             return Item::hidden();
         }
         let waiting = self.waiting();
-        let busy = self.sessions.iter().any(|s| s.status == Status::Busy);
-        // Claude's mark, in its orange. Dimmed while nothing works or waits. Not animated while
-        // busy: sessions are busy for most of the day, and an icon that keeps moving keeps the
-        // bar drawing (about 10% CPU).
-        let logo = ui::image(include_bytes!("../assets/claude.svg"));
-        let logo = if busy || waiting > 0 {
-            logo
-        } else {
-            logo.tone(Tone::Dim)
+        // The mascot, in the mood of the session that most needs saying. It acts out a change of
+        // mood, then rests: sessions work most of the day, and a mascot that keeps moving keeps
+        // the bar drawing. Only a question goes on, until it's answered. Dimmed while nothing
+        // works, waits or just finished.
+        let mood = self.mood();
+        let sprite = mood.sprite();
+        let logo = ui::sprite(sprite.frames, sprite.order);
+        let logo = match mood {
+            Mood::Question => logo.looping(),
+            mood if mood.resting() => logo.tone(Tone::Dim),
+            _ => logo,
         };
         let content = match waiting {
             0 => logo,
@@ -430,6 +464,7 @@ impl Claude {
                 self.open = true;
                 Effect::none()
             }
+            Message::Tick => Effect::none(),
             Message::Closed => {
                 self.open = false;
                 self.page = Page::Sessions;
@@ -485,6 +520,7 @@ impl Claude {
         let id = hook.session_id;
         match hook.hook_event_name.as_str() {
             "UserPromptSubmit" => {
+                self.failed_turns.remove(&id);
                 self.settle_session(&id);
                 self.notes.retain(|note| note.session != id);
                 if let (Some(session), Some(title)) = (self.session_mut(&id), hook.session_title) {
@@ -492,6 +528,7 @@ impl Claude {
                 }
             }
             "Stop" if hook.agent_id.is_none() => {
+                self.failed_turns.remove(&id);
                 self.settle_session(&id);
                 let reply = hook.last_assistant_message.unwrap_or_default();
                 if let Some(session) = self.session_mut(&id) {
@@ -503,6 +540,7 @@ impl Claude {
                 }
             }
             "StopFailure" => {
+                self.failed_turns.insert(id.clone());
                 self.settle_session(&id);
                 let error = match hook.error {
                     Value::String(error) => error,
@@ -522,11 +560,19 @@ impl Claude {
         }
     }
 
-    /// Keeps the mode a session works in outside plan mode, to go back to after a plan.
+    /// Keeps whether a session is in plan mode, and the mode it works in outside it, to go back
+    /// to after a plan.
     fn remember_mode(&mut self, hook: &hooks::Hook) {
         let mode = hook.permission_mode.as_str();
-        if !mode.is_empty() && mode != "plan" && !hook.session_id.is_empty() {
-            self.modes.insert(hook.session_id.clone(), mode.to_string());
+        let id = &hook.session_id;
+        if mode.is_empty() || id.is_empty() {
+            return;
+        }
+        if mode == "plan" {
+            self.planning.insert(id.clone());
+        } else {
+            self.planning.remove(id);
+            self.modes.insert(id.clone(), mode.to_string());
         }
     }
 
@@ -577,6 +623,8 @@ impl Claude {
                 status: live.status,
                 socket: live.socket,
                 last_reply,
+                started: live.started,
+                since: live.since,
             });
         }
         // Gone: their prompts can't be answered any more.
@@ -584,6 +632,8 @@ impl Claude {
             self.settle_session(&gone.id);
             self.notes.retain(|note| note.session != gone.id);
             self.modes.remove(&gone.id);
+            self.planning.remove(&gone.id);
+            self.failed_turns.remove(&gone.id);
         }
         // A prompt whose session stopped waiting was answered in the terminal.
         let mut stale = Vec::new();
@@ -664,6 +714,10 @@ impl Claude {
             "updatedInput": input,
             "updatedPermissions": [{"type": "setMode", "mode": mode, "destination": "session"}],
         });
+        // Out of plan mode once approved, before a hook says so.
+        if let Some(session) = self.prompt(id).map(|prompt| prompt.session.clone()) {
+            self.planning.remove(&session);
+        }
         self.decide(id, decision)
     }
 
@@ -854,6 +908,46 @@ impl Claude {
         let key = self.next_note;
         self.next_note += 1;
         self.notes.insert(0, Note { key, session, kind });
+    }
+
+    /// What the mascot makes of `session`.
+    fn facts(&self, session: &Session) -> Facts {
+        Facts {
+            asked: matches!(session.status, Status::Waiting(_))
+                || self.prompts.iter().any(|p| p.session == session.id),
+            busy: session.status == Status::Busy,
+            plan: self.planning.contains(&session.id),
+            failed: self.failed_turns.contains(&session.id),
+            started: session.started,
+            since: session.since,
+        }
+    }
+
+    fn mood_of(&self, session: &Session) -> Mood {
+        mood::mood(&self.facts(session), self.clock)
+    }
+
+    /// The most pressing mood of all: the bar's.
+    fn mood(&self) -> Mood {
+        let stray = self
+            .prompts
+            .iter()
+            .any(|p| self.session(&p.session).is_none());
+        let moods = self.sessions.iter().map(|s| self.mood_of(s));
+        let mood = moods.max().unwrap_or(Mood::Coffee);
+        if stray { Mood::Question } else { mood }
+    }
+
+    /// When time alone next changes a session's mood, in milliseconds since the epoch.
+    fn next_change(&self) -> Option<u64> {
+        let mut boundary = None;
+        self.sessions
+            .iter()
+            .filter_map(|session| {
+                let boundary = *boundary.get_or_insert_with(mood::next_boundary);
+                mood::next_change(&self.facts(session), self.clock, boundary)
+            })
+            .min()
     }
 
     fn session(&self, id: &str) -> Option<&Session> {
@@ -1140,6 +1234,7 @@ impl Claude {
             actions,
             reply: reply.map(str::to_string),
             seconds: None,
+            mood: Mood::Question,
         }
     }
 
@@ -1163,6 +1258,10 @@ impl Claude {
                 ("Waiting for you in the terminal", what.clone(), None, None)
             }
         };
+        let mood = match note.kind {
+            NoteKind::Done(_) => Mood::Happy,
+            NoteKind::Failed(_) | NoteKind::Waiting(_) => Mood::Question,
+        };
         notify::Note {
             app: label,
             summary: summary.into(),
@@ -1170,6 +1269,7 @@ impl Claude {
             actions,
             reply,
             seconds,
+            mood,
         }
     }
 }
@@ -1210,7 +1310,10 @@ impl Claude {
         } else {
             rows.push(ui::list(self.sessions.iter().map(|session| {
                 let asked = self.prompts.iter().any(|p| p.session == session.id);
+                // While the popover is open, every session's mascot acts out its mood.
+                let sprite = self.mood_of(session).sprite();
                 let row = ui::list_item(session.label())
+                    .leading(ui::sprite(sprite.frames, sprite.order).looping())
                     .subtitle(format!(
                         "{} · {}",
                         directory(&session.cwd),

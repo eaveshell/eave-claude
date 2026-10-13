@@ -3,8 +3,9 @@
 //! (eave-notifications) or mako, dunst, swaync. Answers come back as its signals: an action
 //! picked, a reply typed (KDE's inline reply), a notification closed.
 //!
-//! Claude's logo goes with each one as a file in `$XDG_RUNTIME_DIR`, so it shows without an icon
-//! theme. The bodies are Claude's Markdown, which eave sets as such (`x-eave-markdown`); other
+//! The mascot goes with each one, in the note's mood, as a file in `$XDG_RUNTIME_DIR`: servers
+//! take pictures by path, and it shows without an icon theme. Notifications are still pictures,
+//! so it's the sprite's resting frame, made square. The bodies are Claude's Markdown, which eave sets as such (`x-eave-markdown`); other
 //! daemons show it as it is.
 
 use std::collections::HashMap;
@@ -14,6 +15,8 @@ use std::sync::OnceLock;
 use eave_dbus::zbus::zvariant::Value;
 use eave_dbus::zbus::{self, MatchRule, MessageStream};
 use futures_util::{Stream, StreamExt, stream};
+
+use crate::mood::Mood;
 
 const NAME: &str = "org.freedesktop.Notifications";
 const PATH: &str = "/org/freedesktop/Notifications";
@@ -31,6 +34,8 @@ pub struct Note {
     pub reply: Option<String>,
     /// Shown until dismissed, or for this many seconds.
     pub seconds: Option<u64>,
+    /// The mascot's, as its picture.
+    pub mood: Mood,
 }
 
 /// What the notification server said about one of the notifications.
@@ -62,9 +67,9 @@ pub async fn send(note: Note, replaces: u32) -> zbus::Result<u32> {
     let mut hints: HashMap<&str, Value<'_>> = HashMap::new();
     hints.insert("x-eave-markdown", Value::from(true));
     hints.insert("urgency", Value::from(1u8));
-    let logo = logo();
-    if let Some(logo) = &logo {
-        hints.insert("image-path", Value::from(logo.as_str()));
+    let picture = picture(note.mood);
+    if let Some(picture) = &picture {
+        hints.insert("image-path", Value::from(picture.as_str()));
     }
     if let Some(placeholder) = &note.reply {
         hints.insert(
@@ -84,7 +89,7 @@ pub async fn send(note: Note, replaces: u32) -> zbus::Result<u32> {
             &(
                 note.app.as_str(),
                 replaces,
-                logo.as_deref().unwrap_or(""),
+                picture.as_deref().unwrap_or(""),
                 note.summary.as_str(),
                 note.body.as_str(),
                 actions,
@@ -151,15 +156,19 @@ fn signal(message: &zbus::Message) -> Option<Signal> {
     }
 }
 
-/// Claude's logo as a file, written once: notification servers take icons by path.
-fn logo() -> Option<String> {
-    static LOGO: OnceLock<Option<String>> = OnceLock::new();
-    LOGO.get_or_init(|| {
-        let dir = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("eave-claude");
-        std::fs::create_dir_all(&dir).ok()?;
-        let path = dir.join("claude.svg");
-        std::fs::write(&path, include_bytes!("../assets/claude.svg")).ok()?;
-        Some(path.to_str()?.to_string())
-    })
-    .clone()
+/// The mascot in `mood`, at rest, as a file written once: notification servers take pictures by
+/// path.
+fn picture(mood: Mood) -> Option<String> {
+    static PICTURES: [OnceLock<Option<String>>; Mood::ALL.len()] =
+        [const { OnceLock::new() }; Mood::ALL.len()];
+    let at = Mood::ALL.iter().position(|m| *m == mood)?;
+    PICTURES[at]
+        .get_or_init(|| {
+            let dir = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("eave-claude");
+            std::fs::create_dir_all(&dir).ok()?;
+            let path = dir.join(format!("{}.png", mood.name()));
+            std::fs::write(&path, mood.sprite().note).ok()?;
+            Some(path.to_str()?.to_string())
+        })
+        .clone()
 }

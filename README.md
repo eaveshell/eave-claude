@@ -22,8 +22,18 @@ Then, in Claude Code, install the plugin that tells the bar what your sessions a
 Sessions started afterwards use it. Without the plugin, the bar still lists your sessions and says
 when one waits for you in the terminal, but can't answer for it.
 
-- **In the bar:** the Claude icon while sessions run, dimmed while none works or waits, with a
-  count of the ones waiting for you.
+- **In the bar:** a little mascot while sessions run, in the mood of the one that most needs
+  saying, with a count of the ones waiting for you. It acts out a change of mood, then sits still;
+  only a question keeps it going until you answer.
+
+  | Mood | When |
+  |---|---|
+  | question | a session asks you something: a permission, a question, a plan to approve |
+  | planning | working in plan mode |
+  | laptop | working |
+  | happy | finished its turn, in the last five minutes |
+  | coffee | idle a while, by day (dimmed) |
+  | sleeping | idle a while, between 22:00 and 07:00 (dimmed) |
 - **Permission prompts:** Allow, Deny (Claude stops, like Esc in the terminal), or type into the
   field what Claude should do instead. The chat also has Allow, and don't ask again.
 - **Questions** (AskUserQuestion): a question with two short options gets them as buttons, and
@@ -32,7 +42,7 @@ when one waits for you in the terminal, but can't answer for it.
 - **Plans:** the plan, in Markdown, with Approve, or type what should change to send it back.
   Approving goes back to the mode the session was in before planning, as in the terminal.
 - **Done:** when a session finishes its turn, its last reply, with a field to answer it.
-- **The popover:** your sessions, with what each is doing. A click opens its chat: the
+- **The popover:** your sessions, each with its mascot, and what it's doing. A click opens its chat: the
   conversation as it happens, Markdown and all, the tools it runs, what it's doing now, what it
   asks you, and a field to message it. Show focuses its terminal. Clicking a notification opens
   its session's chat.
@@ -43,7 +53,7 @@ answer first wins. Options: `done` (say so when a turn finishes, default `true`)
 
 Notifications go over the session bus like any app's, so they show in eave with
 [eave-notifications](https://github.com/eaveshell/eave-notifications), or in mako, dunst or
-swaync. They carry Claude's logo, which ships with the plugin, and Markdown bodies, which eave sets
+swaync. They carry the mascot, in the mood that fits (asking, or happy when done), and Markdown bodies, which eave sets
 as such. In eave, the field to answer is right on the notification; the bar takes the keyboard
 only once you click it.
 
@@ -60,6 +70,15 @@ only once you click it.
 The session files, the transcript and the messaging socket are Claude Code's own and
 undocumented (written against 2.1.293), so the bar reads them loosely and skips what it can't.
 The hooks are documented.
+
+## The mascot
+
+Its sprites are drawn as text, in the `.px` files of the mascot repository (with its `pixel.py`).
+`assets/mascot/export.py` turns them into the PNG frames here and `src/mascot.rs`:
+
+```fish
+python3 -I assets/mascot/export.py ~/code/mascot
+```
 
 ## Developing
 
