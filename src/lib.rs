@@ -107,6 +107,10 @@ enum Ask {
         questions: Vec<Question>,
         input: Value,
         picks: Vec<Vec<usize>>,
+        /// Answers typed instead of picked.
+        own: Vec<Option<String>>,
+        /// The one the popover shows: they come one at a time.
+        at: usize,
     },
     /// ExitPlanMode: a plan to approve.
     Plan { plan: String },
@@ -159,6 +163,8 @@ pub enum Message {
     Pick(u64, usize, usize),
     /// Sends the options picked.
     Submit(u64),
+    /// Shows another question of a prompt.
+    Turn(u64, usize),
     StartReply(Target),
     Draft(Target, String),
     SendReply,
@@ -222,6 +228,19 @@ impl Widget for Claude {
             ),
             Message::Pick(id, question, option) => self.pick(id, question, option),
             Message::Submit(id) => self.submit(id),
+            Message::Turn(id, question) => {
+                if let Some(Ask::Question { questions, at, .. }) = self
+                    .prompts
+                    .iter_mut()
+                    .find(|p| p.id == id)
+                    .map(|p| &mut p.ask)
+                    && question < questions.len()
+                {
+                    *at = question;
+                }
+                self.drop_draft(&Target::Prompt(id));
+                Effect::none()
+            }
             Message::StartReply(target) => {
                 self.draft = Some((target, String::new()));
                 Effect::none()
@@ -533,7 +552,10 @@ impl Claude {
 
     fn pick(&mut self, id: u64, question: usize, option: usize) -> Effect<Message> {
         let Some(Ask::Question {
-            questions, picks, ..
+            questions,
+            picks,
+            own,
+            ..
         }) = self
             .prompts
             .iter_mut()
@@ -548,6 +570,7 @@ impl Claude {
         if option >= asked.options.len() {
             return Effect::none();
         }
+        own[question] = None;
         let picked = &mut picks[question];
         if asked.multiple {
             match picked.iter().position(|o| *o == option) {
@@ -556,13 +579,39 @@ impl Claude {
                 }
                 None => picked.push(option),
             }
-        } else {
-            *picked = vec![option];
+            return Effect::none();
         }
-        // One question, one answer: nothing else to wait for.
-        if questions.len() == 1 && !asked.multiple {
-            return self.submit(id);
+        *picked = vec![option];
+        self.answered_one(id, question)
+    }
+
+    /// Question `question` of prompt `id` has its answer: on to the next one without, or send
+    /// them all once the last one has it.
+    fn answered_one(&mut self, id: u64, question: usize) -> Effect<Message> {
+        let Some(Ask::Question {
+            questions,
+            picks,
+            own,
+            at,
+            ..
+        }) = self
+            .prompts
+            .iter_mut()
+            .find(|p| p.id == id)
+            .map(|p| &mut p.ask)
+        else {
+            return Effect::none();
+        };
+        let unanswered = |q: &usize| picks[*q].is_empty() && own[*q].is_none();
+        let last = questions.len() - 1;
+        match (0..questions.len()).find(unanswered) {
+            None if question == last => return self.submit(id),
+            // The next one, or the first one left behind.
+            _ if question < last => *at = question + 1,
+            Some(first) => *at = first,
+            None => {}
         }
+        self.drop_draft(&Target::Prompt(id));
         Effect::none()
     }
 
@@ -572,24 +621,33 @@ impl Claude {
             questions,
             input,
             picks,
+            own,
+            ..
         }) = self.prompt(id).map(|p| &p.ask)
         else {
             return Effect::none();
         };
-        if picks.iter().any(Vec::is_empty) {
-            return Effect::none();
-        }
-        let answers = questions
+        let answers: Option<serde_json::Map<_, _>> = questions
             .iter()
-            .zip(picks)
-            .map(|(question, picked)| {
-                let labels: Vec<_> = picked
-                    .iter()
-                    .map(|o| question.options[*o].0.as_str())
-                    .collect();
-                (question.text.clone(), Value::String(labels.join(", ")))
+            .zip(picks.iter().zip(own))
+            .map(|(question, (picked, own))| {
+                let answer = match own {
+                    Some(own) => own.clone(),
+                    None if picked.is_empty() => return None,
+                    None => {
+                        let labels: Vec<_> = picked
+                            .iter()
+                            .map(|o| question.options[*o].0.as_str())
+                            .collect();
+                        labels.join(", ")
+                    }
+                };
+                Some((question.text.clone(), Value::String(answer)))
             })
             .collect();
+        let Some(answers) = answers else {
+            return Effect::none();
+        };
         let decision = answered(input, answers);
         self.decide(id, decision)
     }
@@ -605,21 +663,25 @@ impl Claude {
         }
         match target {
             Target::Prompt(id) => {
+                // An answer of your own, to the question showing.
+                if let Some(Ask::Question { picks, own, at, .. }) = self
+                    .prompts
+                    .iter_mut()
+                    .find(|p| p.id == id)
+                    .map(|p| &mut p.ask)
+                {
+                    let question = *at;
+                    picks[question].clear();
+                    own[question] = Some(text);
+                    return self.answered_one(id, question);
+                }
                 let decision = match self.prompt(id).map(|p| &p.ask) {
                     // What you'd have Claude do instead, or what to change in the plan: Claude
                     // reads it and carries on.
                     Some(Ask::Permission { .. } | Ask::Plan { .. }) => {
                         json!({"behavior": "deny", "message": text})
                     }
-                    Some(Ask::Question {
-                        questions, input, ..
-                    }) => {
-                        let answers = questions
-                            .iter()
-                            .map(|q| (q.text.clone(), Value::String(text.clone())));
-                        answered(input, answers.collect())
-                    }
-                    None => return Effect::none(),
+                    Some(Ask::Question { .. }) | None => return Effect::none(),
                 };
                 let effect = self.decide(id, decision);
                 if self.page == Page::Prompt(id) {
@@ -994,29 +1056,55 @@ impl Claude {
                 rows.push(field("What should change?"));
             }
             Ask::Question {
-                questions, picks, ..
+                questions,
+                picks,
+                own,
+                at,
+                ..
             } => {
-                for (index, question) in questions.iter().enumerate() {
-                    rows.push(ui::section(question_title(question)));
-                    rows.push(ui::label(&question.text));
-                    rows.push(ui::list(question.options.iter().enumerate().map(
-                        |(option, (choice, description))| {
-                            let row = ui::list_item(choice)
-                                .selected(picks[index].contains(&option))
-                                .on_press(Message::Pick(id, index, option));
-                            if description.is_empty() {
-                                row
-                            } else {
-                                row.subtitle(description)
-                            }
-                        },
-                    )));
+                // One at a time, with arrows between them: four lists don't fit.
+                let index = *at;
+                let question = &questions[index];
+                let count = questions.len();
+                let mut section = ui::section(question_title(question));
+                if count > 1 {
+                    let mut steps = Vec::new();
+                    if index > 0 {
+                        steps.push(ui::button(
+                            ui::icon(ui::Icon::Back),
+                            Message::Turn(id, index - 1),
+                        ));
+                    }
+                    steps.push(ui::label(format!("{} of {count}", index + 1)).tone(Tone::Dim));
+                    if index + 1 < count {
+                        steps.push(ui::button(
+                            ui::icon(ui::Icon::Forward),
+                            Message::Turn(id, index + 1),
+                        ));
+                    }
+                    section = section.trailing(ui::row(steps));
                 }
-                if questions.len() > 1 || questions.iter().any(|q| q.multiple) {
+                rows.push(section);
+                rows.push(ui::label(&question.text));
+                rows.push(ui::list(question.options.iter().enumerate().map(
+                    |(option, (choice, description))| {
+                        let row = ui::list_item(choice)
+                            .selected(picks[index].contains(&option))
+                            .on_press(Message::Pick(id, index, option));
+                        if description.is_empty() {
+                            row
+                        } else {
+                            row.subtitle(description)
+                        }
+                    },
+                )));
+                if let Some(own) = &own[index] {
+                    rows.push(ui::label(format!("Your answer: {own}")).tone(Tone::Accent));
+                }
+                rows.push(field("Or answer in your own words"));
+                let all = (0..count).all(|q| !picks[q].is_empty() || own[q].is_some());
+                if (count > 1 || question.multiple) && (all || index + 1 == count) {
                     rows.push(ui::button(ui::label("Send"), Message::Submit(id)).prominent());
-                }
-                if questions.len() == 1 {
-                    rows.push(field("Or answer in your own words"));
                 }
             }
         }
@@ -1036,11 +1124,13 @@ fn ask(hook: &hooks::Hook) -> Ask {
                 .filter_map(question)
                 .collect();
             if !questions.is_empty() {
-                let picks = vec![Vec::new(); questions.len()];
+                let count = questions.len();
                 return Ask::Question {
                     questions,
                     input: input.clone(),
-                    picks,
+                    picks: vec![Vec::new(); count],
+                    own: vec![None; count],
+                    at: 0,
                 };
             }
         }

@@ -172,7 +172,7 @@ fn a_short_question_answers_from_the_notice() {
 }
 
 #[test]
-fn an_answer_of_your_own_goes_to_every_question_asked() {
+fn an_answer_of_your_own_answers_the_question_showing() {
     let mut widget = claude();
     let input =
         json!({"questions": [{"question": "Name?", "options": [{"label": "A"}, {"label": "B"}]}]});
@@ -420,4 +420,41 @@ fn pages_change_within_the_open_popover() {
     let _ = widget.update(Message::Closed);
     assert_eq!(widget.page, Page::Sessions);
     assert!(asks_to_open(&mut widget, Page::Sessions));
+}
+
+#[test]
+fn questions_come_one_at_a_time() {
+    let mut widget = claude();
+    let input = json!({"questions": [
+        {"question": "One?", "options": [{"label": "A"}, {"label": "B"}]},
+        {"question": "Two?", "options": [{"label": "C"}, {"label": "D"}]},
+        {"question": "Three?", "options": [{"label": "E"}, {"label": "F"}]},
+    ]});
+    let mut answer = ask(&mut widget, 10_015, "s", "AskUserQuestion", input);
+    let at = |widget: &Claude| match &widget.prompts[0].ask {
+        Ask::Question { at, .. } => *at,
+        _ => unreachable!(),
+    };
+    assert_eq!(at(&widget), 0);
+    // Picking moves on to the next one.
+    let _ = widget.update(Message::Pick(10_015, 0, 1));
+    assert_eq!(at(&widget), 1);
+    // Typing answers the one showing, and moves on too.
+    let _ = widget.update(Message::Draft(Target::Prompt(10_015), "my own".into()));
+    let _ = widget.update(Message::SendReply);
+    assert_eq!(at(&widget), 2);
+    // The arrows go back, and a change there doesn't send while one is left.
+    let _ = widget.update(Message::Turn(10_015, 0));
+    let _ = widget.update(Message::Pick(10_015, 0, 0));
+    assert_eq!(at(&widget), 1);
+    assert!(answer.try_recv().is_err());
+    let _ = widget.update(Message::Turn(10_015, 9));
+    assert_eq!(at(&widget), 1, "no such question");
+    // The last one answered sends them all.
+    let _ = widget.update(Message::Turn(10_015, 2));
+    let _ = widget.update(Message::Pick(10_015, 2, 1));
+    assert_eq!(
+        decision(&mut answer)["updatedInput"]["answers"],
+        json!({"One?": "A", "Two?": "my own", "Three?": "F"})
+    );
 }

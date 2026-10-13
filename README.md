@@ -27,7 +27,8 @@ when one waits for you in the terminal, but can't answer for it.
 - **Permission prompts:** Allow, Deny (Claude stops, like Esc in the terminal), or Instead… to
   tell Claude what to do instead. The popover also has Allow, and don't ask again.
 - **Questions** (AskUserQuestion): a question with two short options gets them as buttons, and
-  Other… for an answer of your own. Longer ones open the popover, one list per question.
+  Other… for an answer of your own. Longer ones open the popover, one question at a time with
+  arrows between them: picking an option moves on, and answering the last one sends them all.
 - **Plans:** Approve, or Change… to send it back with what should change.
 - **Done:** when a session finishes its turn, its last reply, and Reply to answer it. Clicking it
   focuses the session's terminal.
