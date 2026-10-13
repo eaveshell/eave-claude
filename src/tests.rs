@@ -306,6 +306,33 @@ fn approving_a_plan_gives_its_input_back_and_leaves_plan_mode() {
 }
 
 #[test]
+fn an_approved_plan_goes_on_in_the_configured_mode() {
+    let mut widget = Claude::new(Config {
+        plan: Some("auto".into()),
+        ..Config::default()
+    })
+    .0;
+    let submit = hook(
+        "s",
+        "UserPromptSubmit",
+        json!({"permission_mode": "default"}),
+    );
+    let _ = widget.update(Message::Hooks(hooks::Event::Hook(Box::new(submit))));
+    let mut answer = ask(
+        &mut widget,
+        10_019,
+        "s",
+        "ExitPlanMode",
+        json!({"plan": "p"}),
+    );
+    let _ = widget.update(Message::Approve(10_019));
+    assert_eq!(
+        decision(&mut answer)["updatedPermissions"][0]["mode"],
+        "auto"
+    );
+}
+
+#[test]
 fn notifications_go_up_once_and_close_when_answered_elsewhere() {
     let mut widget = claude();
     let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
@@ -641,7 +668,9 @@ fn tools_are_described_briefly() {
 #[test]
 fn config_has_defaults() {
     let config: Config = toml::from_str("timeout = 3").unwrap();
-    assert_eq!((config.done, config.timeout), (true, 3));
+    assert_eq!((config.done, config.timeout, config.plan), (true, 3, None));
+    let config: Config = toml::from_str(r#"plan = "auto""#).unwrap();
+    assert_eq!(config.plan.as_deref(), Some("auto"));
     assert!(toml::from_str::<Config>("nope = 1").is_err());
 }
 

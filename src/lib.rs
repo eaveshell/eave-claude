@@ -46,6 +46,9 @@ pub struct Config {
     done: bool,
     /// Seconds that shows.
     timeout: u64,
+    /// The mode an approved plan goes on in: `auto`, `acceptEdits`, `default`… Unset, the one
+    /// the session was in before planning.
+    plan: Option<String>,
 }
 
 impl Default for Config {
@@ -53,6 +56,7 @@ impl Default for Config {
         Self {
             done: true,
             timeout: 8,
+            plan: None,
         }
     }
 }
@@ -685,7 +689,8 @@ impl Claude {
     }
 
     /// Approves plan `id`: Claude Code wants its input back for this tool, and goes on in the
-    /// mode the session was in before planning, as when you approve in the terminal.
+    /// mode the config says, else the one the session was in before planning, as when you
+    /// approve in the terminal.
     fn approve(&mut self, id: u64) -> Effect<Message> {
         let Some(prompt) = self.prompt(id) else {
             return Effect::none();
@@ -707,9 +712,10 @@ impl Claude {
                     .filter(|mode| *mode != "plan")
             });
         let mode = self
-            .modes
-            .get(&prompt.session)
-            .map(String::as_str)
+            .config
+            .plan
+            .as_deref()
+            .or_else(|| self.modes.get(&prompt.session).map(String::as_str))
             .or(suggested)
             .unwrap_or("default");
         let decision = json!({
