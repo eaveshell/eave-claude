@@ -10,9 +10,9 @@ and the notifications are black.
 
 - <name>-<n>.png: each frame, the 16x10 art pixel for pixel. eave scales sprites up whole pixels
   at a time, so the smallest file is the sharpest.
-- <name>-note.png: the resting frame for notifications, centered in a 16x16 square and scaled x8
-  to 128x128. A notification's picture is cropped square and shrunk by averaging, which a square
-  of whole 8x8 blocks goes through untouched.
+- <name>-note.png: the resting frame for notifications, centered in a 16x16 square and scaled
+  x10 to 160x160. eave shows a notification's picture 40 px across, 80 screen pixels at scale 2:
+  exactly half, so whole 10x10 blocks shrink to whole 5x5 ones and stay sharp.
 """
 import importlib.util
 import sys
@@ -20,7 +20,7 @@ from pathlib import Path
 
 SPRITES = ["planning", "laptop", "question", "happy", "coffee", "sleeping"]
 SIDE = 16
-NOTE_SCALE = 8
+NOTE_SCALE = 10
 
 HERE = Path(__file__).resolve().parent
 RUST = HERE.parent.parent / "src" / "mascot.rs"
