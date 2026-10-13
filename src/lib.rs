@@ -318,12 +318,14 @@ impl Widget for Claude {
         }
         let waiting = self.waiting();
         let busy = self.sessions.iter().any(|s| s.status == Status::Busy);
-        // An icon called `claude` in your icon theme, if you have one; else a C.
+        // An icon called `claude` in your icon theme, if you have one; else a C. Dimmed while
+        // nothing works or waits. Not animated while busy: sessions are busy for most of the
+        // day, and an icon that keeps moving keeps the bar drawing (about 10% CPU).
         let logo = ui::app_icon("claude");
-        let logo = match (busy, waiting) {
-            (true, _) => ui::gulp(logo),
-            (false, 0) => logo.tone(Tone::Dim),
-            (false, _) => logo,
+        let logo = if busy || waiting > 0 {
+            logo
+        } else {
+            logo.tone(Tone::Dim)
         };
         let content = match waiting {
             0 => logo,
