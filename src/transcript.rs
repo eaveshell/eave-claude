@@ -12,6 +12,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::mem::MaybeUninit;
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, Local};
+use eave_api::ui::Change;
 use futures_util::{Stream, stream};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::inotify::{self, CreateFlags, WatchFlags};
@@ -24,24 +26,45 @@ const TAIL: u64 = 512 << 10;
 const KEEP: usize = 200;
 /// The longest text kept of one message.
 const LONGEST: usize = 6000;
+/// The most lines of a change kept, and of a new file's start.
+const DIFF_LINES: usize = 60;
+const NEW_FILE_LINES: usize = 40;
+/// The longest a tool's result is said in.
+const RESULT: usize = 120;
 
 /// One thing in a conversation.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
-    /// What you said.
-    You(String),
+    /// What you said, and when, if the transcript says.
+    You {
+        text: String,
+        at: Option<DateTime<Local>>,
+    },
     /// What Claude said: Markdown.
     Claude(String),
-    /// A tool Claude used: what for, and whether it's done yet, or failed.
+    /// A tool Claude used: what for, and whether it's done yet, or failed. Once done, what came
+    /// of it in a line (a count, the error), and the change it made to a file, if it did.
     Tool {
         id: String,
         name: String,
         what: String,
         done: bool,
         failed: bool,
+        result: String,
+        diff: Option<Vec<(Change, String)>>,
     },
     /// Something that happened, said in passing: an interruption, a command.
     Aside(String),
+}
+
+impl Entry {
+    /// What you said, at a time not known.
+    pub fn you(text: impl Into<String>) -> Self {
+        Entry::You {
+            text: text.into(),
+            at: None,
+        }
+    }
 }
 
 /// The conversation so far, newest last.
@@ -81,11 +104,21 @@ impl Chat {
 
     fn user(&mut self, line: &Value) {
         let meta = line["isMeta"].as_bool() == Some(true);
+        let at = line["timestamp"]
+            .as_str()
+            .and_then(|at| DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| at.with_timezone(&Local));
+        let said = |text: &str| {
+            said(text).map(|entry| match entry {
+                Entry::You { text, .. } => Entry::You { text, at },
+                entry => entry,
+            })
+        };
         match &line["message"]["content"] {
             Value::String(text) if meta => {
                 // Messages typed in the bar arrive as from another session.
                 if let Some(text) = from_bar(text) {
-                    self.push(Entry::You(text));
+                    self.push(Entry::You { text, at });
                 }
             }
             Value::String(text) => {
@@ -94,12 +127,18 @@ impl Chat {
                 }
             }
             Value::Array(items) => {
+                // What the tool returned, in full, is beside the result when there's one.
+                let results = items
+                    .iter()
+                    .filter(|item| item["type"] == "tool_result")
+                    .count();
+                let returned = (results == 1).then(|| &line["toolUseResult"]);
                 for item in items {
                     match item["type"].as_str() {
                         Some("tool_result") => {
                             let id = item["tool_use_id"].as_str().unwrap_or_default();
                             let failed = item["is_error"].as_bool() == Some(true);
-                            self.finish(id, failed);
+                            self.finish(id, failed, &content(&item["content"]), returned);
                         }
                         Some("text") if !meta => {
                             if let Some(entry) = item["text"].as_str().and_then(said) {
@@ -134,6 +173,8 @@ impl Chat {
                         what: crate::describe(name, &item["input"], cwd),
                         done: false,
                         failed: false,
+                        result: String::new(),
+                        diff: None,
                     });
                 }
                 _ => {}
@@ -145,20 +186,38 @@ impl Chat {
         self.entries.push(entry);
     }
 
-    /// The tool call `id` is done.
-    fn finish(&mut self, id: &str, failed: bool) {
-        let call = self.entries.iter_mut().rev().find_map(|entry| match entry {
-            Entry::Tool {
-                id: call,
-                done,
-                failed: flag,
-                ..
-            } if call == id => Some((done, flag)),
-            _ => None,
-        });
-        if let Some((done, flag)) = call {
-            *done = true;
-            *flag = failed;
+    /// The tool call `id` is done: it said `content`, and returned `returned`, if known.
+    fn finish(&mut self, id: &str, failed: bool, content: &str, returned: Option<&Value>) {
+        let call = self
+            .entries
+            .iter_mut()
+            .rev()
+            .find(|entry| matches!(entry, Entry::Tool { id: call, .. } if call == id));
+        let Some(Entry::Tool {
+            name,
+            done,
+            failed: flag,
+            result,
+            diff,
+            ..
+        }) = call
+        else {
+            return;
+        };
+        *done = true;
+        *flag = failed;
+        let returned = returned.unwrap_or(&Value::Null);
+        *result = if failed {
+            first_line(
+                &content
+                    .replace("<tool_use_error>", "")
+                    .replace("</tool_use_error>", ""),
+            )
+        } else {
+            summary(name, content, returned)
+        };
+        if !failed {
+            *diff = change(returned);
         }
     }
 
@@ -176,6 +235,100 @@ impl Chat {
     }
 }
 
+/// A tool result's text: a string, or a list of blocks of it.
+fn content(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn first_line(text: &str) -> String {
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty());
+    crate::shorten(line.unwrap_or_default(), RESULT)
+}
+
+/// What came of a tool, in a few words: lines read, a command's last line, files found. Tools
+/// whose result is long prose (an agent's report, a page) or a change (shown as one) say nothing.
+fn summary(name: &str, content: &str, returned: &Value) -> String {
+    match name {
+        "Read" => match returned["file"]["numLines"].as_u64() {
+            Some(1) => "1 line".into(),
+            Some(lines) => format!("{lines} lines"),
+            None => String::new(),
+        },
+        "Bash" => {
+            let out = returned["stdout"].as_str().unwrap_or(content);
+            let last = out.lines().map(str::trim).rfind(|line| !line.is_empty());
+            crate::shorten(last.unwrap_or_default(), RESULT)
+        }
+        "Grep" | "Glob" => first_line(content),
+        _ => String::new(),
+    }
+}
+
+/// The change an Edit, MultiEdit or Write made, from the patch Claude Code keeps of it, or a new
+/// file's first lines.
+fn change(returned: &Value) -> Option<Vec<(Change, String)>> {
+    let mut lines = Vec::new();
+    if let Some(hunks) = returned["structuredPatch"]
+        .as_array()
+        .filter(|h| !h.is_empty())
+    {
+        for hunk in hunks {
+            let number = |key: &str| hunk[key].as_u64().unwrap_or(0);
+            lines.push((
+                Change::Hunk,
+                format!(
+                    "@@ -{},{} +{},{} @@",
+                    number("oldStart"),
+                    number("oldLines"),
+                    number("newStart"),
+                    number("newLines")
+                ),
+            ));
+            for line in hunk["lines"].as_array().into_iter().flatten() {
+                let line = line.as_str().unwrap_or_default();
+                let (kind, text) = match line.chars().next() {
+                    Some('+') => (Change::Added, &line[1..]),
+                    Some('-') => (Change::Removed, &line[1..]),
+                    Some(' ') => (Change::Context, &line[1..]),
+                    // "\ No newline at end of file"
+                    _ => continue,
+                };
+                lines.push((kind, text.to_string()));
+            }
+        }
+        return Some(cut(lines, DIFF_LINES));
+    }
+    if returned["type"] == "create" {
+        let content = returned["content"].as_str()?;
+        lines.extend(
+            content
+                .lines()
+                .map(|line| (Change::Added, line.to_string())),
+        );
+        return Some(cut(lines, NEW_FILE_LINES));
+    }
+    None
+}
+
+/// The first `most` lines, then how many more there were.
+fn cut(mut lines: Vec<(Change, String)>, most: usize) -> Vec<(Change, String)> {
+    if lines.len() > most {
+        let more = lines.len() - most;
+        lines.truncate(most);
+        let unit = if more == 1 { "line" } else { "lines" };
+        lines.push((Change::Hunk, format!("… {more} more {unit}")));
+    }
+    lines
+}
+
 /// What a line you sent shows as, if anything: your words, a command you ran, or an
 /// interruption. Claude Code's own notes to Claude, like a task finishing, aren't shown.
 fn said(text: &str) -> Option<Entry> {
@@ -189,10 +342,10 @@ fn said(text: &str) -> Option<Entry> {
     if let Some(command) = between(text, "<command-name>", "</command-name>") {
         let args = between(text, "<command-args>", "</command-args>").unwrap_or_default();
         let command = format!("{command} {args}").trim().to_string();
-        return Some(Entry::You(command));
+        return Some(Entry::you(command));
     }
     if let Some(input) = between(text, "<bash-input>", "</bash-input>") {
-        return Some(Entry::You(format!("! {input}")));
+        return Some(Entry::you(format!("! {input}")));
     }
     let hidden = [
         "<task-notification>",
@@ -206,9 +359,9 @@ fn said(text: &str) -> Option<Entry> {
         return None;
     }
     if let Some(text) = from_bar(text) {
-        return Some(Entry::You(text));
+        return Some(Entry::you(text));
     }
-    Some(Entry::You(crate::shorten(text, LONGEST)))
+    Some(Entry::you(crate::shorten(text, LONGEST)))
 }
 
 /// What you typed in the bar, from the message [`peer`](crate::peer) wrapped it in.
@@ -398,7 +551,7 @@ mod tests {
         assert_eq!(
             chat.entries,
             [
-                Entry::You("fix the bar".into()),
+                Entry::you("fix the bar"),
                 Entry::Claude("Looking.".into()),
                 Entry::Tool {
                     id: "t1".into(),
@@ -406,6 +559,8 @@ mod tests {
                     what: "$ cargo test".into(),
                     done: true,
                     failed: false,
+                    result: "ok".into(),
+                    diff: None,
                 },
                 Entry::Tool {
                     id: "t2".into(),
@@ -413,6 +568,8 @@ mod tests {
                     what: "src/lib.rs".into(),
                     done: false,
                     failed: false,
+                    result: String::new(),
+                    diff: None,
                 },
             ]
         );
@@ -432,10 +589,7 @@ mod tests {
         ]);
         assert_eq!(
             chat.entries,
-            [
-                Entry::You("/context".into()),
-                Entry::Aside("Interrupted".into())
-            ]
+            [Entry::you("/context"), Entry::Aside("Interrupted".into())]
         );
     }
 
@@ -445,7 +599,7 @@ mod tests {
         let line = serde_json::json!({"type":"user","isMeta":true,"message":{"content":
             format!("Another Claude session sent a message:\n<agent-message from=\"x\">\n{wrapped}\n</agent-message>")}});
         let chat = chat(&[&line.to_string()]);
-        assert_eq!(chat.entries, [Entry::You("ship it\nnow".into())]);
+        assert_eq!(chat.entries, [Entry::you("ship it\nnow")]);
     }
 
     #[test]
@@ -462,7 +616,7 @@ mod tests {
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         let chat = chat(&refs);
         assert_eq!(chat.entries.len(), KEEP);
-        assert_eq!(chat.entries.last(), Some(&Entry::You("message 299".into())));
+        assert_eq!(chat.entries.last(), Some(&Entry::you("message 299")));
         let mut short = Chat::default();
         for line in &lines[..2] {
             short.read_line(line, "/");
@@ -475,6 +629,67 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn results_say_what_came_of_a_tool_and_edits_their_change() {
+        let chat = chat(&[
+            r#"{"type":"user","timestamp":"2026-10-13T12:02:00.000Z","message":{"content":"go"}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"r","name":"Read","input":{"file_path":"/home/f/code/eave/a.rs"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"r","content":"..."}]},"toolUseResult":{"type":"text","file":{"numLines":812}}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"b","name":"Bash","input":{"command":"cargo test"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"b","content":"x"}]},"toolUseResult":{"stdout":"running\ntest result: ok. 184 passed\n\n","stderr":""}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"f","name":"Bash","input":{"command":"cc"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"f","is_error":true,"content":"<tool_use_error>linker not found</tool_use_error>"}]}}"#,
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"e","name":"Edit","input":{"file_path":"/home/f/code/eave/a.rs"}}]}}"#,
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"e","content":"ok"}]},"toolUseResult":{"structuredPatch":[{"oldStart":88,"oldLines":2,"newStart":88,"newLines":2,"lines":[" keep","-old","+new","\\ No newline at end of file"]}]}}"#,
+        ]);
+        let Entry::You { at: Some(at), .. } = &chat.entries[0] else {
+            panic!("the time was lost");
+        };
+        assert_eq!(at.to_utc().to_rfc3339(), "2026-10-13T12:02:00+00:00");
+        let results: Vec<_> = chat.entries[1..]
+            .iter()
+            .map(|entry| match entry {
+                Entry::Tool { result, .. } => result.as_str(),
+                _ => panic!("not a tool"),
+            })
+            .collect();
+        assert_eq!(
+            results,
+            [
+                "812 lines",
+                "test result: ok. 184 passed",
+                "linker not found",
+                ""
+            ]
+        );
+        let Entry::Tool {
+            diff: Some(diff), ..
+        } = &chat.entries[4]
+        else {
+            panic!("the edit lost its change");
+        };
+        assert_eq!(
+            diff,
+            &[
+                (Change::Hunk, "@@ -88,2 +88,2 @@".to_string()),
+                (Change::Context, "keep".into()),
+                (Change::Removed, "old".into()),
+                (Change::Added, "new".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_long_change_is_cut() {
+        let lines: Vec<_> = (0..100).map(|n| format!("+{n}")).collect();
+        let returned = serde_json::json!({"structuredPatch":[{"oldStart":1,"oldLines":0,"newStart":1,"newLines":100,"lines":lines}]});
+        let diff = change(&returned).unwrap();
+        assert_eq!(diff.len(), DIFF_LINES + 1);
+        assert_eq!(diff.last().unwrap().1, "… 41 more lines");
+        let created = serde_json::json!({"type":"create","content":"a\nb"});
+        assert_eq!(change(&created).unwrap().len(), 2);
     }
 
     #[test]
@@ -494,7 +709,7 @@ mod tests {
         };
         let mut chat = Chat::default();
         assert!(reader.read(&mut chat, "/"));
-        assert_eq!(chat.entries, [Entry::You("one".into())]);
+        assert_eq!(chat.entries, [Entry::you("one")]);
         assert!(!reader.read(&mut chat, "/"), "nothing new");
         use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
@@ -503,10 +718,7 @@ mod tests {
             .unwrap();
         file.write_all(b"age\":{\"content\":\"two\"}}\n").unwrap();
         assert!(reader.read(&mut chat, "/"));
-        assert_eq!(
-            chat.entries,
-            [Entry::You("one".into()), Entry::You("two".into())]
-        );
+        assert_eq!(chat.entries, [Entry::you("one"), Entry::you("two")]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

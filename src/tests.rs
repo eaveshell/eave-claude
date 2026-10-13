@@ -507,6 +507,83 @@ fn code_is_inline_or_a_block() {
 }
 
 #[test]
+fn a_command_to_allow_is_a_shell_block() {
+    assert_eq!(command("Bash", "$ cargo test"), "```sh\ncargo test\n```");
+    assert_eq!(command("Read", "src/lib.rs"), "`src/lib.rs`");
+}
+
+#[test]
+fn a_chat_reads_as_a_timeline() {
+    let at = chrono::Local::now();
+    let entries = [
+        Entry::You {
+            text: "fix it".into(),
+            at: Some(at),
+        },
+        Entry::Claude("Looking.".into()),
+        Entry::Tool {
+            id: "a".into(),
+            name: "Read".into(),
+            what: "src/lib.rs".into(),
+            done: true,
+            failed: false,
+            result: "12 lines".into(),
+            diff: None,
+        },
+        Entry::Tool {
+            id: "b".into(),
+            name: "Bash".into(),
+            what: "$ false".into(),
+            done: true,
+            failed: true,
+            result: "exit 1".into(),
+            diff: None,
+        },
+        Entry::you("and now?"),
+        Entry::Tool {
+            id: "c".into(),
+            name: "Bash".into(),
+            what: "$ ssh asahi".into(),
+            done: false,
+            failed: false,
+            result: String::new(),
+            diff: None,
+        },
+    ];
+    let marks = |nodes: Vec<ui::Node<Message>>| -> Vec<Vec<ui::Mark>> {
+        nodes
+            .into_iter()
+            .filter_map(|node| match node.into_kind() {
+                ui::Kind::Timeline(steps) => Some(
+                    steps
+                        .into_iter()
+                        .map(|step| match step.into_kind() {
+                            ui::Kind::Step { mark, .. } => mark,
+                            _ => panic!("a step that isn't one"),
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    };
+    let nodes = conversation(&entries, true, Mood::Laptop);
+    assert!(
+        matches!(nodes[0].kind(), ui::Kind::Divider { text } if *text == at.format("%H:%M").to_string()),
+        "a turn opens with its time"
+    );
+    // The second turn has no time: a plain line.
+    assert!(matches!(nodes[2].kind(), ui::Kind::Separator));
+    use ui::Mark::*;
+    assert_eq!(
+        marks(nodes),
+        [vec![You, Note, Done, Failed], vec![You, Waiting]]
+    );
+    let nodes = conversation(&entries, false, Mood::Laptop);
+    assert_eq!(marks(nodes)[1], [You, Running]);
+}
+
+#[test]
 fn tools_are_described_briefly() {
     let cwd = "/w";
     assert_eq!(
