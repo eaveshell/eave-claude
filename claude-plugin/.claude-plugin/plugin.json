@@ -1,0 +1,10 @@
+{
+  "name": "eave",
+  "version": "0.1.0",
+  "description": "Shows your sessions in the eave bar, and lets you answer their prompts and questions from its notifications",
+  "author": {
+    "name": "eaveshell"
+  },
+  "homepage": "https://github.com/eaveshell/eave-claude",
+  "license": "MIT"
+}

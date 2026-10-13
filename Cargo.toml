@@ -1,0 +1,30 @@
+[package]
+name = "eave-claude"
+version = "0.1.0"
+description = "Claude Code for eave: your sessions in the bar, and their questions and permission prompts answered from notifications"
+# Compiled into a bar by eave-build, from git.
+publish = false
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/eaveshell/eave-claude"
+
+[dependencies]
+# From crates.io. When eave-build compiles the plugin into a bar, it patches these to the eave it
+# builds, so the host and the plugin share one.
+eave-api = "0.1"
+# Focuses the terminal a session runs in.
+eave-hyprland = "0.1"
+# The hook server's event stream. Already in the build through iced.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Watches ~/.claude/sessions with inotify. Already in the build through the Wayland stack, and
+# what eave's own config watcher uses.
+rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+# Hook payloads, session files and transcripts are JSON. Already in the build through eave-hyprland.
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# The hook server's Unix socket, the sessions' peer sockets, and the channels between them and the
+# widget. Already in the build, with these features, through eave-hyprland.
+tokio = { version = "1", default-features = false, features = ["net", "io-util", "sync", "rt"] }
+
+[dev-dependencies]
+toml = { version = "0.9", default-features = false, features = ["std", "parse", "serde"] }

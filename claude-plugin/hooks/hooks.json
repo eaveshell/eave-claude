@@ -1,0 +1,59 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS --fail --unix-socket \"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/eave-claude.sock\" -H \"Content-Type: application/json\" -H \"Expect:\" --data-binary @- --max-time 2 http://eave/hook >/dev/null 2>&1 || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS --fail --unix-socket \"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/eave-claude.sock\" -H \"Content-Type: application/json\" -H \"Expect:\" --data-binary @- --max-time 2 http://eave/hook >/dev/null 2>&1 || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS --fail --unix-socket \"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/eave-claude.sock\" -H \"Content-Type: application/json\" -H \"Expect:\" --data-binary @- --max-time 2 http://eave/hook >/dev/null 2>&1 || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS --fail --unix-socket \"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/eave-claude.sock\" -H \"Content-Type: application/json\" -H \"Expect:\" --data-binary @- --max-time 2 http://eave/hook >/dev/null 2>&1 || true",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "curl -sS --fail --unix-socket \"${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/eave-claude.sock\" -H \"Content-Type: application/json\" -H \"Expect:\" --data-binary @- http://eave/hook 2>/dev/null || true",
+            "timeout": 86400
+          }
+        ]
+      }
+    ]
+  }
+}
