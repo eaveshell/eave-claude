@@ -39,8 +39,9 @@ Whatever you answer in the bar, the terminal shows the same prompt meanwhile, an
 answer first wins. Options: `done` (say so when a turn finishes, default `true`) and `timeout`
 (seconds that shows, default 8).
 
-The bar shows the icon called `claude` in your icon theme, and a C if there is none. To see the
-logo, put one at `~/.local/share/icons/hicolor/scalable/apps/claude.svg`.
+The bar shows Claude's logo, which ships with the plugin. Its notifications show the icon called
+`claude` in your icon theme, and a C if there is none. To see the logo there too, put one at
+`~/.local/share/icons/hicolor/scalable/apps/claude.svg`.
 
 ## How it works
 
