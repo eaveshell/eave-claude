@@ -66,6 +66,8 @@ pub struct Claude {
     page: Page,
     /// What's being typed, and where it goes.
     draft: Option<(Target, String)>,
+    /// Whether the popover shows.
+    open: bool,
 }
 
 struct Session {
@@ -165,13 +167,14 @@ pub enum Message {
     Hide(u64),
     Expired(u64),
     Dismiss(u64),
-    /// Opens the popover on a page.
+    /// Goes to a page, opening the popover if it's closed.
     Show(Page),
     Back,
     /// Focuses the terminal a session runs in.
     Focus(String),
     /// A session has waited a moment: say so if no hook asked.
     Unasked(String),
+    Opened,
     Closed,
 }
 
@@ -189,6 +192,7 @@ impl Widget for Claude {
             next_note: NOTE_KEYS,
             page: Page::Sessions,
             draft: None,
+            open: false,
         };
         (claude, Task::none())
     }
@@ -248,7 +252,13 @@ impl Widget for Claude {
             }
             Message::Show(page) => {
                 self.page = page;
-                Effect::none().open_popover()
+                // Asking the host to open an open popover closes it first, and closing resets
+                // the page: within the popover, just change pages.
+                if self.open {
+                    Effect::none()
+                } else {
+                    Effect::none().open_popover()
+                }
             }
             Message::Back => {
                 self.page = match &self.page {
@@ -297,7 +307,12 @@ impl Widget for Claude {
                 }
                 Effect::none()
             }
+            Message::Opened => {
+                self.open = true;
+                Effect::none()
+            }
             Message::Closed => {
+                self.open = false;
                 self.page = Page::Sessions;
                 self.draft = None;
                 Effect::none()
@@ -344,7 +359,11 @@ impl Widget for Claude {
             Page::Sessions => None,
         };
         let content = page.unwrap_or_else(|| self.sessions_page());
-        Some(Panel::new(content).on_close(Message::Closed))
+        Some(
+            Panel::new(content)
+                .on_open(Message::Opened)
+                .on_close(Message::Closed),
+        )
     }
 
     fn notices(&self) -> Vec<Notice<Message>> {

@@ -403,3 +403,21 @@ fn config_has_defaults() {
     assert_eq!((config.done, config.timeout), (true, 3));
     assert!(toml::from_str::<Config>("nope = 1").is_err());
 }
+
+#[test]
+fn pages_change_within_the_open_popover() {
+    let mut widget = claude();
+    let _ = widget.update(Message::Sessions(vec![live("s", Status::Idle)]));
+    let asks_to_open =
+        |widget: &mut Claude, page| widget.update(Message::Show(page)).into_parts().1.is_some();
+    // From a notice: the popover opens on the page.
+    assert!(asks_to_open(&mut widget, Page::Session("s".into())));
+    let _ = widget.update(Message::Opened);
+    let _ = widget.update(Message::Back);
+    // Within it: opening it again would close it first, and lose the page.
+    assert!(!asks_to_open(&mut widget, Page::Session("s".into())));
+    assert_eq!(widget.page, Page::Session("s".into()));
+    let _ = widget.update(Message::Closed);
+    assert_eq!(widget.page, Page::Sessions);
+    assert!(asks_to_open(&mut widget, Page::Sessions));
+}
