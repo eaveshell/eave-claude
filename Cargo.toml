@@ -14,7 +14,7 @@ repository = "https://github.com/eaveshell/eave-claude"
 eave-api = "0.1.2"
 # Notifications go over the session bus (eave's D-52), on the bar's shared connection. zbus is
 # already in the build through eave's other plugins.
-eave-dbus = "0.1"
+eave-dbus = "0.1.1"
 # Focuses the terminal a session runs in.
 eave-hyprland = "0.1"
 # The hook server's event stream. Already in the build through iced.
