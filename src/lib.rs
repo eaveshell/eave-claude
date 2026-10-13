@@ -129,6 +129,8 @@ enum Ask {
     Permission {
         tool: String,
         what: String,
+        /// What it says it's for, if it says: Bash's `description`.
+        why: Option<String>,
         /// The rules the terminal offers as "don't ask again".
         always: Option<Value>,
     },
@@ -188,6 +190,9 @@ struct Posted {
     id: Option<u32>,
     /// No longer wanted, before its id came: close it once it does.
     gone: bool,
+    /// What it says, as last sent: one that changes is sent again in its place, as a question
+    /// of several moves on.
+    note: notify::Note,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1071,16 +1076,24 @@ impl Claude {
             }
         });
         for (key, note) in wanted {
-            if self.posted.iter().any(|posted| posted.key == key) {
-                continue;
+            let mut replaces = 0;
+            if let Some(posted) = self.posted.iter_mut().find(|posted| posted.key == key) {
+                // Up and unchanged, or still on its way up.
+                match posted.id {
+                    Some(id) if posted.note != note => replaces = id,
+                    _ => continue,
+                }
+                posted.note = note.clone();
+            } else {
+                self.posted.push(Posted {
+                    key,
+                    id: None,
+                    gone: false,
+                    note: note.clone(),
+                });
             }
-            self.posted.push(Posted {
-                key,
-                id: None,
-                gone: false,
-            });
             tasks.push(Task::future(async move {
-                match notify::send(note, 0).await {
+                match notify::send(note, replaces).await {
                     Ok(id) => Message::Posted(key, Some(id)),
                     Err(error) => {
                         eprintln!("eave-claude: can't show a notification: {error}");
@@ -1112,6 +1125,7 @@ impl Claude {
     fn signalled(&mut self, signal: notify::Signal) -> Effect<Message> {
         let id = match &signal {
             notify::Signal::Action(id, _)
+            | notify::Signal::Picked(id, _)
             | notify::Signal::Replied(id, _)
             | notify::Signal::Closed(id, _) => *id,
         };
@@ -1119,13 +1133,33 @@ impl Claude {
             return Effect::none();
         };
         let key = self.posted[at].key;
+        // One of several questions stays up on eave while it's answered: it moves on in place.
+        let stepping = self.posted[at]
+            .note
+            .question
+            .as_ref()
+            .is_some_and(|question| question.step.1 > 1);
         match signal {
+            notify::Signal::Action(_, action)
+                if stepping && (action.starts_with("pick:") || action == notify::BACK) =>
+            {
+                self.acted(key, &action)
+            }
             notify::Signal::Action(_, action) => {
                 // The server takes it away after an action.
                 self.posted.remove(at);
                 let effect = self.acted(key, &action);
                 self.hidden(key);
                 effect
+            }
+            notify::Signal::Picked(_, keys) => {
+                if !stepping {
+                    self.posted.remove(at);
+                }
+                match key {
+                    Key::Prompt(prompt) => self.picked(prompt, &keys),
+                    Key::Note(_) => Effect::none(),
+                }
             }
             notify::Signal::Replied(_, text) => {
                 self.posted.remove(at);
@@ -1179,11 +1213,19 @@ impl Claude {
         match key {
             Key::Prompt(id) => match action {
                 "allow" => self.handle(Message::Allow(id)),
+                "always" => self.handle(Message::AlwaysAllow(id)),
                 "deny" => self.handle(Message::Deny(id)),
                 "approve" => self.approve(id),
                 "default" | "answer" => self.show(Page::Prompt(id)),
+                notify::BACK => match self.asking(id) {
+                    Some(at) if at > 0 => self.handle(Message::Turn(id, at - 1)),
+                    _ => Effect::none(),
+                },
                 pick => match pick.strip_prefix("pick:").and_then(|n| n.parse().ok()) {
-                    Some(option) => self.pick(id, 0, option),
+                    Some(option) => {
+                        let at = self.asking(id).unwrap_or(0);
+                        self.pick(id, at, option)
+                    }
                     None => Effect::none(),
                 },
             },
@@ -1200,6 +1242,45 @@ impl Claude {
         }
     }
 
+    /// The question prompt `id` asks now, if it asks questions.
+    fn asking(&self, id: u64) -> Option<usize> {
+        match &self.prompt(id)?.ask {
+            Ask::Question { at, .. } => Some(*at),
+            _ => None,
+        }
+    }
+
+    /// Several options sent from a notification, by key, for the question it asks now.
+    fn picked(&mut self, id: u64, keys: &[String]) -> Effect<Message> {
+        let options: Vec<usize> = keys
+            .iter()
+            .filter_map(|key| key.strip_prefix("pick:")?.parse().ok())
+            .collect();
+        let Some(Ask::Question {
+            questions,
+            picks,
+            own,
+            at,
+            ..
+        }) = self
+            .prompts
+            .iter_mut()
+            .find(|p| p.id == id)
+            .map(|p| &mut p.ask)
+        else {
+            return Effect::none();
+        };
+        let question = *at;
+        let count = questions[question].options.len();
+        let options: Vec<usize> = options.into_iter().filter(|o| *o < count).collect();
+        if options.is_empty() {
+            return Effect::none();
+        }
+        picks[question] = options;
+        own[question] = None;
+        self.answered_one(id, question)
+    }
+
     /// The session a note is about.
     fn note_session(&self, key: Key) -> Option<String> {
         let Key::Note(note) = key else {
@@ -1214,23 +1295,45 @@ impl Claude {
     fn prompt_note(&self, prompt: &Prompt) -> notify::Note {
         let label = self.label(&prompt.session, &prompt.cwd);
         let open = ("default".to_string(), "Open".to_string());
+        let mut question = None;
         let (summary, body, mut actions, reply) = match &prompt.ask {
-            Ask::Permission { tool, what, .. } => (
-                format!("Allow {tool}?"),
-                code(what),
-                vec![
-                    ("allow".into(), "Allow".into()),
-                    ("deny".into(), "Deny".into()),
-                ],
-                Some("Or tell Claude what to do instead"),
-            ),
+            Ask::Permission {
+                tool,
+                what,
+                why,
+                always,
+            } => {
+                let mut actions = vec![("allow".to_string(), "Allow".to_string())];
+                if always.is_some() {
+                    actions.push(("always".into(), "Always allow".into()));
+                }
+                actions.push(("deny".into(), "Deny".into()));
+                // What it's for, when it says, reads better than the tool's name.
+                let summary = match why {
+                    Some(why) => format!("{}?", why.trim_end_matches(['.', '?'])),
+                    None => format!("Allow {tool}?"),
+                };
+                (
+                    summary,
+                    code(what),
+                    actions,
+                    Some("Or tell Claude what to do instead"),
+                )
+            }
             Ask::Plan { plan, .. } => (
                 "Plan ready".into(),
                 plan.clone(),
                 vec![("approve".into(), "Approve".into())],
                 Some("What should change?"),
             ),
-            Ask::Question { questions, .. } => {
+            Ask::Question { questions, at, .. } => {
+                let asked = &questions[*at];
+                question = Some(notify::Asking {
+                    text: asked.text.clone(),
+                    options: asked.options.clone(),
+                    multiple: asked.multiple,
+                    step: (*at as u32, questions.len() as u32),
+                });
                 let first = &questions[0];
                 if questions.len() > 1 || !fits(first) {
                     let summary = match questions.len() {
@@ -1262,6 +1365,9 @@ impl Claude {
         actions.push(open);
         notify::Note {
             app: label,
+            thread: prompt.session.clone(),
+            urgency: 1,
+            question,
             summary,
             body,
             actions,
@@ -1278,18 +1384,31 @@ impl Claude {
         let (summary, body, reply, seconds) = match &note.kind {
             NoteKind::Done(reply) => {
                 let answerable = session.is_some_and(|s| s.socket.is_some());
+                // Its first line says what came of it; the rest is the body.
+                let (summary, body) = headline(reply);
                 (
-                    "Done",
-                    reply.clone(),
+                    summary,
+                    body,
                     answerable.then(|| "Message Claude".to_string()),
                     Some(self.config.timeout.max(1)),
                 )
             }
-            NoteKind::Failed(error) => ("Stopped with an error", error.clone(), None, None),
+            NoteKind::Failed(error) => ("Stopped with an error".into(), error.clone(), None, None),
             NoteKind::Waiting(what) => {
                 actions.insert(0, ("show".into(), "Show".into()));
-                ("Waiting for you in the terminal", what.clone(), None, None)
+                (
+                    "Waiting for you in the terminal".into(),
+                    what.clone(),
+                    None,
+                    None,
+                )
             }
+        };
+        // A turn that failed waits for you: it's news that can't wait.
+        let urgency = if matches!(note.kind, NoteKind::Failed(_)) {
+            2
+        } else {
+            1
         };
         let mood = match note.kind {
             NoteKind::Done(_) => Mood::Happy,
@@ -1297,7 +1416,10 @@ impl Claude {
         };
         notify::Note {
             app: label,
-            summary: summary.into(),
+            thread: note.session.clone(),
+            urgency,
+            question: None,
+            summary,
             body,
             actions,
             reply,
@@ -1305,6 +1427,26 @@ impl Claude {
             mood,
         }
     }
+}
+
+/// The longest a reply's first line is as a notification's summary; past it, it's cut at a word.
+const HEADLINE: usize = 80;
+
+/// A reply's first line, without Markdown's heading and emphasis marks, as a summary, and the rest
+/// as the body. A first line too long for a summary leaves it all in the body, under "Done".
+fn headline(reply: &str) -> (String, String) {
+    let reply = reply.trim();
+    let (first, rest) = reply.split_once('\n').unwrap_or((reply, ""));
+    let first = first
+        .trim()
+        .trim_start_matches('#')
+        .trim()
+        .trim_matches('*')
+        .trim();
+    if first.is_empty() || first.chars().count() > HEADLINE || first.starts_with("```") {
+        return ("Done".into(), reply.to_string());
+    }
+    (first.to_string(), rest.trim().to_string())
 }
 
 /// Closes the notification `id`.
@@ -1488,7 +1630,9 @@ impl Claude {
         let id = prompt.id;
         let mut rows = Vec::new();
         match &prompt.ask {
-            Ask::Permission { tool, what, always } => {
+            Ask::Permission {
+                tool, what, always, ..
+            } => {
                 rows.push(ui::section(format!("Allow {tool}?")));
                 if !what.is_empty() {
                     rows.push(ui::markdown(command(tool, what)));
@@ -1755,9 +1899,14 @@ fn ask(hook: &hooks::Hook) -> Ask {
         Value::Array(rules) if !rules.is_empty() => Some(hook.permission_suggestions.clone()),
         _ => None,
     };
+    let why = match hook.tool_name.as_str() {
+        "Bash" => Some(text(&input["description"])).filter(|why| !why.is_empty()),
+        _ => None,
+    };
     Ask::Permission {
         tool: tool_name(&hook.tool_name),
         what: describe(&hook.tool_name, input, &hook.cwd),
+        why,
         always,
     }
 }

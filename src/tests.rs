@@ -95,7 +95,11 @@ fn a_permission_prompt_is_a_notice_that_answers() {
     assert_eq!(shown[0].summary, "Allow Bash?");
     assert_eq!(shown[0].body, "`$ rm -rf target`");
     assert_eq!(shown[0].app, "Bar plugin");
-    assert_eq!(labels(&shown[0]), ["Allow", "Deny", "Open"]);
+    assert_eq!(
+        labels(&shown[0]),
+        ["Allow", "Always allow", "Deny", "Open"],
+        "always, as the terminal suggested rules"
+    );
     assert_eq!(
         shown[0].reply.as_deref(),
         Some("Or tell Claude what to do instead")
@@ -424,8 +428,11 @@ fn a_finished_turn_says_so_and_takes_a_reply() {
     );
     let _ = widget.update(Message::Hooks(hooks::Event::Hook(Box::new(stop))));
     let shown = notices(&widget);
-    assert_eq!(shown[0].summary, "Done");
-    assert_eq!(shown[0].body, "All tests pass.");
+    assert_eq!(
+        shown[0].summary, "All tests pass.",
+        "its first line says it"
+    );
+    assert_eq!(shown[0].body, "");
     assert_eq!(labels(&shown[0]), ["Open"]);
     assert_eq!(shown[0].reply.as_deref(), Some("Message Claude"));
     assert_eq!(shown[0].seconds, Some(8));
@@ -762,4 +769,120 @@ fn the_mascot_works_plans_asks_and_rests() {
     let _ = widget.update(Message::Sessions(vec![done]));
     assert!(widget.mood().resting());
     assert!(widget.next_change().is_some_and(|at| at > now));
+}
+
+#[test]
+fn a_reply_s_first_line_is_its_headline() {
+    assert_eq!(
+        headline("## Fixed the reload\n\nThe watcher follows the link."),
+        (
+            "Fixed the reload".to_string(),
+            "The watcher follows the link.".to_string()
+        )
+    );
+    assert_eq!(headline("**Done.**"), ("Done.".to_string(), String::new()));
+    let long = "word ".repeat(30);
+    assert_eq!(headline(&long).0, "Done", "too long to be one");
+    assert_eq!(headline("```rust\nfn a() {}\n```").0, "Done");
+}
+
+#[test]
+fn a_command_that_says_what_it_s_for_asks_that() {
+    let mut widget = claude();
+    let _answer = ask(
+        &mut widget,
+        10_120,
+        "s",
+        "Bash",
+        json!({"command": "cargo test --workspace", "description": "Run the workspace tests."}),
+    );
+    assert_eq!(notices(&widget)[0].summary, "Run the workspace tests?");
+}
+
+#[test]
+fn always_allow_from_the_notification_sends_the_suggested_rules() {
+    let mut widget = claude();
+    let mut answer = ask(&mut widget, 10_121, "s", "Bash", json!({"command": "ls"}));
+    posted(&mut widget, Key::Prompt(10_121), 9);
+    let _ = signal(&mut widget, notify::Signal::Action(9, "always".into()));
+    assert_eq!(
+        decision(&mut answer),
+        json!({"behavior": "allow", "updatedPermissions": [{"type": "addRules"}]})
+    );
+}
+
+#[test]
+fn a_failed_turn_is_critical() {
+    let mut widget = claude();
+    let _ = widget.update(Message::Sessions(vec![live("s", Status::Idle)]));
+    let failed = hook("s", "StopFailure", json!({"error": "rate limited"}));
+    let _ = widget.update(Message::Hooks(hooks::Event::Hook(Box::new(failed))));
+    let shown = notices(&widget);
+    assert_eq!(shown[0].summary, "Stopped with an error");
+    assert_eq!(shown[0].urgency, 2);
+}
+
+const EAVE: notify::Caps = notify::Caps {
+    threads: true,
+    choices: true,
+};
+
+#[test]
+fn eave_gets_a_question_s_options_and_a_way_back() {
+    let mut widget = claude();
+    let input = json!({"questions": [
+        {"question": "Which renderer?", "header": "Renderer", "options": [
+            {"label": "GPU (Recommended)", "description": "The default"},
+            {"label": "CPU", "description": "Steadier"},
+            {"label": "Both", "description": "Twice the time"}]},
+        {"question": "How long?", "options": [{"label": "10 s"}, {"label": "30 s"}]},
+    ]});
+    let _answer = ask(&mut widget, 10_130, "s", "AskUserQuestion", input);
+    let plain = notices(&widget).remove(0);
+    assert_eq!(labels(&plain), ["Answer…", "Open"], "others get the chat");
+
+    let rich = notify::rich(plain.clone(), EAVE);
+    assert_eq!(rich.summary, "Which renderer?");
+    assert_eq!(rich.body, "");
+    assert_eq!(labels(&rich), ["Open"], "the options are the question's");
+    assert_eq!(rich.reply.as_deref(), Some("Or answer in your own words"));
+    let question = rich.question.as_ref().expect("asked");
+    assert_eq!(question.step, (0, 2));
+    assert_eq!(question.options.len(), 3);
+    assert_eq!(notify::rich(plain, notify::Caps::default()).question, None);
+
+    // Picked on the card: it stays up, and moves on to the next question in place.
+    posted(&mut widget, Key::Prompt(10_130), 11);
+    let _ = signal(&mut widget, notify::Signal::Action(11, "pick:1".into()));
+    assert_eq!(widget.posted.len(), 1, "still up");
+    let step = widget.posted[0].note.question.as_ref().map(|q| q.step);
+    assert_eq!(step, Some((1, 2)), "sent again for the next question");
+    let rich = notify::rich(widget.posted[0].note.clone(), EAVE);
+    assert_eq!(labels(&rich), ["Open", "Back"]);
+
+    // Back, then on again.
+    let _ = signal(&mut widget, notify::Signal::Action(11, notify::BACK.into()));
+    let step = widget.posted[0].note.question.as_ref().map(|q| q.step);
+    assert_eq!(step, Some((0, 2)));
+}
+
+#[test]
+fn several_picks_from_the_card_answer_a_question() {
+    let mut widget = claude();
+    let input = json!({"questions": [
+        {"question": "Which hints?", "multiSelect": true, "options": [
+            {"label": "image-data"}, {"label": "value"}, {"label": "transient"}]},
+    ]});
+    let mut answer = ask(&mut widget, 10_131, "s", "AskUserQuestion", input);
+    posted(&mut widget, Key::Prompt(10_131), 12);
+    let picked = vec![
+        "pick:2".to_string(),
+        "pick:0".to_string(),
+        "pick:9".to_string(),
+    ];
+    let _ = signal(&mut widget, notify::Signal::Picked(12, picked));
+    assert_eq!(
+        decision(&mut answer)["updatedInput"]["answers"],
+        json!({"Which hints?": "transient, image-data"})
+    );
 }

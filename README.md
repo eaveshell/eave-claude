@@ -34,15 +34,19 @@ when one waits for you in the terminal, but can't answer for it.
   | happy | finished its turn, in the last five minutes |
   | coffee | idle a while, by day (dimmed) |
   | sleeping | idle a while, between 22:00 and 07:00 (dimmed) |
-- **Permission prompts:** Allow, Deny (Claude stops, like Esc in the terminal), or type into the
-  field what Claude should do instead. The chat also has Allow, and don't ask again.
-- **Questions** (AskUserQuestion): a question with two short options gets them as buttons, and
-  the field takes an answer of your own. Longer ones open the chat, one question at a time with
-  arrows between them: picking an option moves on, and answering the last one sends them all.
+- **Permission prompts:** Allow, Always allow (the terminal's "don't ask again"), Deny (Claude
+  stops, like Esc in the terminal), or type into the field what Claude should do instead. A
+  command that says what it's for asks that: "Run the workspace tests?".
+- **Questions** (AskUserQuestion): in eave, answered on the notification. Every option shows, with
+  what it means and the one Claude recommends; with several to pick, check them and Send. Several
+  questions come one at a time on the same notification, with Back: picking moves on, and
+  answering the last one sends them all. The field takes an answer of your own. Other
+  notification daemons get two short options as buttons, and anything longer opens the chat.
 - **Plans:** the plan, in Markdown, with Approve, or type what should change to send it back.
   Approving goes back to the mode the session was in before planning, as in the terminal, or
   to the mode set in `plan`.
-- **Done:** when a session finishes its turn, its last reply, with a field to answer it.
+- **Done:** when a session finishes its turn, its last reply, its first line as the title, with a
+  field to answer it. A turn that stops with an error is critical: it stays until you see it.
 - **The popover:** your sessions, each with its mascot, and what it's doing. A click opens its chat: the
   conversation as it happens, a turn at a time under the time you spoke, its steps strung on a
   line, each marked done, under way, failed or waiting for you. Markdown and all, with code
@@ -61,7 +65,8 @@ unset, the one before planning).
 Notifications go over the session bus like any app's, so they show in eave with
 [eave-notifications](https://github.com/eaveshell/eave-notifications), or in mako, dunst or
 swaync. They carry the mascot, in the mood that fits (asking, or happy when done), and Markdown bodies, which eave sets
-as such. In eave, the field to answer is right on the notification; the bar takes the keyboard
+as such. In eave they come from Claude, with the session beside it and the mascot as the icon, and
+a session's notifications stack on one card; other daemons show the session as the app. In eave, the field to answer is right on the notification; the bar takes the keyboard
 only once you click it.
 
 ## How it works
