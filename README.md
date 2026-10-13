@@ -40,7 +40,8 @@ when one waits for you in the terminal, but can't answer for it.
   the field takes an answer of your own. Longer ones open the chat, one question at a time with
   arrows between them: picking an option moves on, and answering the last one sends them all.
 - **Plans:** the plan, in Markdown, with Approve, or type what should change to send it back.
-  Approving goes back to the mode the session was in before planning, as in the terminal.
+  Approving goes back to the mode the session was in before planning, as in the terminal, or
+  to the mode set in `plan`.
 - **Done:** when a session finishes its turn, its last reply, with a field to answer it.
 - **The popover:** your sessions, each with its mascot, and what it's doing. A click opens its chat: the
   conversation as it happens, a turn at a time under the time you spoke, its steps strung on a
@@ -54,7 +55,8 @@ reading it already, and what it asks is answered right there.
 
 Whatever you answer in the bar, the terminal shows the same prompt meanwhile, and whichever you
 answer first wins. Options: `done` (say so when a turn finishes, default `true`) and `timeout`
-(seconds that shows, default 8).
+(seconds that shows, default 8), and `plan` (the mode an approved plan goes on in, like `"auto"`;
+unset, the one before planning).
 
 Notifications go over the session bus like any app's, so they show in eave with
 [eave-notifications](https://github.com/eaveshell/eave-notifications), or in mako, dunst or
