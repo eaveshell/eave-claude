@@ -1,0 +1,14 @@
+{
+  "name": "eave-claude",
+  "owner": {
+    "name": "eaveshell"
+  },
+  "description": "Claude Code in the eave status bar",
+  "plugins": [
+    {
+      "name": "eave",
+      "source": "./claude-plugin",
+      "description": "Shows your sessions in the eave bar, and lets you answer their prompts and questions from its notifications"
+    }
+  ]
+}

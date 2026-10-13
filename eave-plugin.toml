@@ -1,0 +1,4 @@
+[plugin]
+name = "claude"
+description = "Claude Code sessions in the bar, with their questions and permission prompts as notifications you can answer"
+api = "0.1"
