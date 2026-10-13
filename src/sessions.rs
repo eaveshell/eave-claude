@@ -45,6 +45,8 @@ pub struct Live {
     pub socket: Option<PathBuf>,
     /// Milliseconds since the epoch.
     pub started: u64,
+    /// When its status last changed, in milliseconds since the epoch.
+    pub since: u64,
 }
 
 /// `~/.claude`, or wherever `CLAUDE_CONFIG_DIR` puts it.
@@ -197,6 +199,7 @@ struct File {
     /// The process's start time, as `/proc/<pid>/stat` has it: tells a reused pid apart.
     proc_start: Option<String>,
     started_at: u64,
+    status_updated_at: Option<u64>,
 }
 
 fn parse(json: &str) -> Option<File> {
@@ -225,6 +228,7 @@ impl File {
             status,
             socket,
             started: self.started_at,
+            since: self.status_updated_at.unwrap_or(self.started_at),
         }
     }
 }
