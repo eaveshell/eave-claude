@@ -159,6 +159,8 @@ struct Note {
     key: u64,
     session: String,
     kind: NoteKind,
+    /// Not shown as a notification: dismissed, or said while its chat showed.
+    hidden: bool,
 }
 
 enum NoteKind {
@@ -265,6 +267,7 @@ impl Widget for Claude {
     fn update(&mut self, message: Message) -> Effect<Message> {
         self.clock = Clock::now();
         let effect = self.handle(message);
+        self.quiet_chat();
         let post = self.post();
         effect.and_task(post)
     }
@@ -907,7 +910,15 @@ impl Claude {
     fn note(&mut self, session: String, kind: NoteKind) {
         let key = self.next_note;
         self.next_note += 1;
-        self.notes.insert(0, Note { key, session, kind });
+        self.notes.insert(
+            0,
+            Note {
+                key,
+                session,
+                kind,
+                hidden: false,
+            },
+        );
     }
 
     /// What the mascot makes of `session`.
@@ -1028,6 +1039,7 @@ impl Claude {
         let notes = self
             .notes
             .iter()
+            .filter(|note| !note.hidden)
             .map(|note| (Key::Note(note.key), self.note_note(note)));
         prompts.chain(notes).collect()
     }
@@ -1130,6 +1142,21 @@ impl Claude {
     }
 
     /// Its notification is gone: a prompt still waits in the popover, a note is done with.
+    /// What the session whose chat shows asks or says needs no notification: you're reading it.
+    /// It stays hidden after the chat closes, so it doesn't pop up then. Any notification already
+    /// up for it goes away.
+    fn quiet_chat(&mut self) {
+        let (true, Page::Chat(id)) = (self.open, &self.page) else {
+            return;
+        };
+        for prompt in self.prompts.iter_mut().filter(|p| p.session == *id) {
+            prompt.hidden = true;
+        }
+        for note in self.notes.iter_mut().filter(|n| n.session == *id) {
+            note.hidden = true;
+        }
+    }
+
     fn hidden(&mut self, key: Key) {
         match key {
             Key::Prompt(id) => {

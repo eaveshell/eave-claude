@@ -49,6 +49,9 @@ when one waits for you in the terminal, but can't answer for it.
   you, and a field to message it. Show focuses its terminal. Clicking a notification opens
   its session's chat.
 
+While a session's chat is open in the popover, it sends no notifications for that session: you're
+reading it already, and what it asks is answered right there.
+
 Whatever you answer in the bar, the terminal shows the same prompt meanwhile, and whichever you
 answer first wins. Options: `done` (say so when a turn finishes, default `true`) and `timeout`
 (seconds that shows, default 8).
