@@ -1297,6 +1297,16 @@ fn code(what: &str) -> String {
     }
 }
 
+/// `what` a tool will do, as Markdown for the popover: a command as a shell block, to be colored.
+fn command(tool: &str, what: &str) -> String {
+    match what.strip_prefix("$ ") {
+        Some(command) if tool == "Bash" && !command.contains("```") => {
+            format!("```sh\n{command}\n```")
+        }
+        _ => code(what),
+    }
+}
+
 // The popover.
 impl Claude {
     /// Every session, with what it's doing: a click opens its chat.
@@ -1364,8 +1374,9 @@ impl Claude {
             .filter(|(id, _)| *id == session.id)
             .map(|(_, chat)| chat);
         let pending = self.pending(&session.id);
+        let waiting = matches!(pending.map(|p| &p.ask), Some(Ask::Permission { .. }));
         let mut conversation = match chat {
-            Some(chat) => conversation(&chat.entries),
+            Some(chat) => conversation(&chat.entries, waiting, self.mood_of(session)),
             None => vec![ui::label("…").tone(Tone::Dim)],
         };
         // A plan to approve is read with the rest.
@@ -1435,7 +1446,7 @@ impl Claude {
             Ask::Permission { tool, what, always } => {
                 rows.push(ui::section(format!("Allow {tool}?")));
                 if !what.is_empty() {
-                    rows.push(ui::markdown(code(what)));
+                    rows.push(ui::markdown(command(tool, what)));
                 }
                 rows.push(ui::grid(
                     2,
@@ -1513,62 +1524,127 @@ impl Claude {
     }
 }
 
-/// The conversation as nodes: who speaks, once per turn, then what they said and did.
-fn conversation(entries: &[Entry]) -> Vec<ui::Node<Message>> {
-    #[derive(PartialEq)]
-    enum Speaker {
-        You,
-        Claude,
-    }
-    let mut nodes = Vec::new();
-    let mut speaking = None;
-    let mut speaks = |nodes: &mut Vec<ui::Node<Message>>, speaker: Speaker| {
-        if speaking.as_ref() != Some(&speaker) {
-            let name = match speaker {
-                Speaker::You => ui::section("You"),
-                Speaker::Claude => ui::section("Claude"),
-            };
-            nodes.push(name);
-            speaking = Some(speaker);
-        }
-    };
+/// The conversation, a turn at a time: when you spoke, then a timeline of what you said and what
+/// Claude said and did, each step marked with how it went. The latest turn's first step from
+/// Claude carries the mascot, in `mood`. While a permission is `waiting`, the tool it's for is
+/// marked as waiting for you.
+fn conversation(entries: &[Entry], waiting: bool, mood: Mood) -> Vec<ui::Node<Message>> {
+    // A turn starts where you speak after Claude, or at the start of what was read.
+    let mut turns: Vec<Vec<&Entry>> = Vec::new();
     for entry in entries {
-        match entry {
-            Entry::You(text) => {
-                speaks(&mut nodes, Speaker::You);
-                nodes.push(ui::markdown(text).tone(Tone::Accent));
-            }
-            Entry::Claude(text) => {
-                speaks(&mut nodes, Speaker::Claude);
-                nodes.push(ui::markdown(text));
-            }
-            Entry::Tool {
-                name,
-                what,
-                done,
-                failed,
-                ..
-            } => {
-                speaks(&mut nodes, Speaker::Claude);
-                let (icon, tone) = match (done, failed) {
-                    (_, true) => (ui::Icon::Close, Tone::Critical),
-                    (true, false) => (ui::Icon::Check, Tone::Dim),
-                    (false, false) => (ui::Icon::Forward, Tone::Accent),
-                };
-                let line = if what.is_empty() {
-                    name.clone()
-                } else {
-                    format!("{name} · {}", first_line(what))
-                };
-                nodes.push(ui::row([ui::icon(icon), ui::label(line)]).tone(tone));
-            }
-            Entry::Aside(text) => nodes.push(ui::label(text).tone(Tone::Dim)),
+        let yours = matches!(entry, Entry::You { .. });
+        let after_claude = turns
+            .last()
+            .and_then(|turn| turn.last())
+            .is_some_and(|last| !matches!(last, Entry::You { .. }));
+        match turns.last_mut() {
+            Some(turn) if !(yours && after_claude) => turn.push(entry),
+            _ => turns.push(vec![entry]),
         }
+    }
+    // Only the call asked about waits: the last one under way.
+    let held = entries
+        .iter()
+        .rfind(|entry| matches!(entry, Entry::Tool { done: false, .. }))
+        .filter(|_| waiting);
+    let latest = turns.len().saturating_sub(1);
+    let today = chrono::Local::now().date_naive();
+    let mut nodes = Vec::new();
+    for (index, turn) in turns.into_iter().enumerate() {
+        let at = turn.iter().find_map(|entry| match entry {
+            Entry::You { at, .. } => *at,
+            _ => None,
+        });
+        match at {
+            Some(at) => nodes.push(ui::divider(when(at, today))),
+            None if index > 0 => nodes.push(ui::separator()),
+            None => {}
+        }
+        let mut mascot = index == latest;
+        let steps = turn.into_iter().map(|entry| {
+            let step = match entry {
+                Entry::You { text, .. } => {
+                    return ui::step(ui::Mark::You, ui::markdown(text).tone(Tone::Accent));
+                }
+                Entry::Claude(text) => ui::step(ui::Mark::Note, ui::markdown(text)),
+                Entry::Tool {
+                    name,
+                    what,
+                    done,
+                    failed,
+                    result,
+                    diff,
+                    ..
+                } => {
+                    let mark = match (done, failed) {
+                        (_, true) => ui::Mark::Failed,
+                        (true, false) => ui::Mark::Done,
+                        (false, false) if held.is_some_and(|held| std::ptr::eq(held, entry)) => {
+                            ui::Mark::Waiting
+                        }
+                        (false, false) => ui::Mark::Running,
+                    };
+                    ui::step(mark, tool(name, what, *failed, result, diff.as_deref()))
+                }
+                Entry::Aside(text) => ui::step(ui::Mark::Note, ui::label(text).tone(Tone::Dim)),
+            };
+            if std::mem::take(&mut mascot) {
+                let sprite = mood.sprite();
+                step.leading(ui::sprite(sprite.frames, sprite.order))
+            } else {
+                step
+            }
+        });
+        nodes.push(ui::timeline(steps.collect::<Vec<_>>()));
     }
     if nodes.is_empty() {
         nodes.push(ui::label("Nothing said yet").tone(Tone::Dim));
     }
     nodes
+}
+
+/// A tool call in a line: its name, what it was for, and what came of it. An error goes under it,
+/// and so does the change it made to a file.
+fn tool(
+    name: &str,
+    what: &str,
+    failed: bool,
+    result: &str,
+    diff: Option<&[(ui::Change, String)]>,
+) -> ui::Node<Message> {
+    let target = first_line(what);
+    let target = target.strip_prefix("$ ").unwrap_or(target);
+    let mut line = vec![ui::label(name)];
+    if target.is_empty() {
+        line.push(ui::fill());
+    } else {
+        line.push(ui::literal(target).tone(Tone::Dim));
+    }
+    if !failed && !result.is_empty() {
+        line.push(ui::label(result).tone(Tone::Dim));
+    }
+    let mut rows = vec![ui::row(line)];
+    if failed && !result.is_empty() {
+        rows.push(ui::label(result).tone(Tone::Critical));
+    }
+    if let Some(diff) = diff.filter(|diff| !diff.is_empty()) {
+        rows.push(ui::diff(target, diff.to_vec()));
+    }
+    match rows.len() {
+        1 => rows.remove(0),
+        _ => ui::column(rows),
+    }
+}
+
+/// When a turn started: the time today, with the day this week, and the date before that.
+fn when(at: chrono::DateTime<chrono::Local>, today: chrono::NaiveDate) -> String {
+    let days = (today - at.date_naive()).num_days();
+    let format = match days {
+        0 => "%H:%M",
+        1..=6 => "%a %H:%M",
+        _ => "%-d %b %H:%M",
+    };
+    at.format(format).to_string()
 }
 
 /// What the session is doing now, in a line.

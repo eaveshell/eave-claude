@@ -43,8 +43,10 @@ when one waits for you in the terminal, but can't answer for it.
   Approving goes back to the mode the session was in before planning, as in the terminal.
 - **Done:** when a session finishes its turn, its last reply, with a field to answer it.
 - **The popover:** your sessions, each with its mascot, and what it's doing. A click opens its chat: the
-  conversation as it happens, Markdown and all, the tools it runs, what it's doing now, what it
-  asks you, and a field to message it. Show focuses its terminal. Clicking a notification opens
+  conversation as it happens, a turn at a time under the time you spoke, its steps strung on a
+  line, each marked done, under way, failed or waiting for you. Markdown and all, with code
+  colored, the tools it runs with what came of them, the edits it makes as diffs, what it asks
+  you, and a field to message it. Show focuses its terminal. Clicking a notification opens
   its session's chat.
 
 Whatever you answer in the bar, the terminal shows the same prompt meanwhile, and whichever you
