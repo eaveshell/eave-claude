@@ -5,10 +5,14 @@
 
 The .px files in the mascot repository are the source; this reuses its pixel.py to read them.
 Each sprite's loop is reduced to its distinct frames, numbered in the order they first show, so
-the loop always starts on frame 0, the one a sprite rests on. Every frame is the 16x10 art in its
-dark colors (the bar and the notifications are black), centered in a 16x16 square and scaled x8
-to 128x128: eave shrinks pictures by halving, so 128 -> 64 -> 32 stays pixel-sharp, and a
-notification's cover crops a square from the middle, which a square loses nothing to.
+the loop always starts on frame 0, the one a sprite rests on. Colors are the dark ones: the bar
+and the notifications are black.
+
+- <name>-<n>.png: each frame, the 16x10 art pixel for pixel. eave scales sprites up whole pixels
+  at a time, so the smallest file is the sharpest.
+- <name>-note.png: the resting frame for notifications, centered in a 16x16 square and scaled x8
+  to 128x128. A notification's picture is cropped square and shrunk by averaging, which a square
+  of whole 8x8 blocks goes through untouched.
 """
 import importlib.util
 import sys
@@ -16,7 +20,7 @@ from pathlib import Path
 
 SPRITES = ["planning", "laptop", "question", "happy", "coffee", "sleeping"]
 SIDE = 16
-SCALE = 8
+NOTE_SCALE = 8
 
 HERE = Path(__file__).resolve().parent
 RUST = HERE.parent.parent / "src" / "mascot.rs"
@@ -57,6 +61,8 @@ def main():
         "pub struct Sprite {",
         "    pub frames: &'static [&'static [u8]],",
         "    pub order: &'static [u8],",
+        "    /// Frame 0 as a square picture, for notifications.",
+        "    pub note: &'static [u8],",
         "}",
     ]
     for name in SPRITES:
@@ -70,8 +76,10 @@ def main():
         files = []
         for n, grid in enumerate(distinct):
             path = HERE / f"{name}-{n}.png"
-            path.write_bytes(pixel.png(square(grid), SCALE))
+            path.write_bytes(pixel.png([list(row) for row in grid], 1))
             files.append(path.name)
+        note = HERE / f"{name}-note.png"
+        note.write_bytes(pixel.png(square(distinct[0]), NOTE_SCALE))
         rust += [
             "",
             f"pub static {name.upper()}: Sprite = Sprite {{",
@@ -79,6 +87,7 @@ def main():
             *(f'        include_bytes!("../assets/mascot/{f}"),' for f in files),
             "    ],",
             f"    order: &[{', '.join(map(str, order))}],",
+            f'    note: include_bytes!("../assets/mascot/{note.name}"),',
             "};",
         ]
         print(f"{name}: {len(files)} frames, order {order}")

@@ -5,6 +5,8 @@
 pub struct Sprite {
     pub frames: &'static [&'static [u8]],
     pub order: &'static [u8],
+    /// Frame 0 as a square picture, for notifications.
+    pub note: &'static [u8],
 }
 
 pub static PLANNING: Sprite = Sprite {
@@ -13,6 +15,7 @@ pub static PLANNING: Sprite = Sprite {
         include_bytes!("../assets/mascot/planning-1.png"),
     ],
     order: &[0, 0, 1, 1, 1, 0, 0, 0],
+    note: include_bytes!("../assets/mascot/planning-note.png"),
 };
 
 pub static LAPTOP: Sprite = Sprite {
@@ -21,6 +24,7 @@ pub static LAPTOP: Sprite = Sprite {
         include_bytes!("../assets/mascot/laptop-1.png"),
     ],
     order: &[0, 0, 1, 1, 1, 0, 0, 1],
+    note: include_bytes!("../assets/mascot/laptop-note.png"),
 };
 
 pub static QUESTION: Sprite = Sprite {
@@ -29,6 +33,7 @@ pub static QUESTION: Sprite = Sprite {
         include_bytes!("../assets/mascot/question-1.png"),
     ],
     order: &[0, 0, 0, 1, 1, 1, 1, 1],
+    note: include_bytes!("../assets/mascot/question-note.png"),
 };
 
 pub static HAPPY: Sprite = Sprite {
@@ -37,6 +42,7 @@ pub static HAPPY: Sprite = Sprite {
         include_bytes!("../assets/mascot/happy-1.png"),
     ],
     order: &[0, 0, 1, 1, 1, 1, 1, 0],
+    note: include_bytes!("../assets/mascot/happy-note.png"),
 };
 
 pub static COFFEE: Sprite = Sprite {
@@ -50,6 +56,7 @@ pub static COFFEE: Sprite = Sprite {
         include_bytes!("../assets/mascot/coffee-6.png"),
     ],
     order: &[0, 1, 2, 3, 4, 1, 5, 6],
+    note: include_bytes!("../assets/mascot/coffee-note.png"),
 };
 
 pub static SLEEPING: Sprite = Sprite {
@@ -59,4 +66,5 @@ pub static SLEEPING: Sprite = Sprite {
         include_bytes!("../assets/mascot/sleeping-2.png"),
     ],
     order: &[0, 0, 0, 0, 1, 2, 2, 1],
+    note: include_bytes!("../assets/mascot/sleeping-note.png"),
 };

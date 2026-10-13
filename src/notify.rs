@@ -5,7 +5,7 @@
 //!
 //! The mascot goes with each one, in the note's mood, as a file in `$XDG_RUNTIME_DIR`: servers
 //! take pictures by path, and it shows without an icon theme. Notifications are still pictures,
-//! so it's the sprite's resting frame. The bodies are Claude's Markdown, which eave sets as such (`x-eave-markdown`); other
+//! so it's the sprite's resting frame, made square. The bodies are Claude's Markdown, which eave sets as such (`x-eave-markdown`); other
 //! daemons show it as it is.
 
 use std::collections::HashMap;
@@ -167,7 +167,7 @@ fn picture(mood: Mood) -> Option<String> {
             let dir = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?).join("eave-claude");
             std::fs::create_dir_all(&dir).ok()?;
             let path = dir.join(format!("{}.png", mood.name()));
-            std::fs::write(&path, mood.sprite().frames.first()?).ok()?;
+            std::fs::write(&path, mood.sprite().note).ok()?;
             Some(path.to_str()?.to_string())
         })
         .clone()
