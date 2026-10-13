@@ -14,7 +14,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
 /// The name Claude sees it from. Not `eave`, which could be taken for a session of that name.
-const FROM: &str = "eave-bar";
+pub const FROM: &str = "eave-bar";
+/// What the message says before what you typed: who it's from, and how to answer.
+pub const PREAMBLE: &str = "This is the user, typing in their desktop bar instead of the \
+     terminal. Answer them here as usual; don't reply with SendMessage.\n\n";
 
 /// Sends `text` to the session of `pid`, listening on `socket`.
 pub async fn send(
@@ -36,12 +39,15 @@ pub async fn send(
     stream.shutdown().await
 }
 
+/// What Claude reads: `text`, wrapped as a message from the bar.
+pub fn content(text: &str) -> String {
+    format!(
+        "<cross-session-message from-name=\"{FROM}\">\n{PREAMBLE}{text}\n</cross-session-message>"
+    )
+}
+
 fn message(text: &str, id: &str) -> String {
-    let content = format!(
-        "<cross-session-message from-name=\"{FROM}\">\n\
-         This is the user, typing in their desktop bar instead of the terminal. Answer them here as \
-         usual; don't reply with SendMessage.\n\n{text}\n</cross-session-message>"
-    );
+    let content = content(text);
     json!({
         "msgV": 1,
         "msg_id": id,

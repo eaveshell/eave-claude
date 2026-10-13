@@ -1,28 +1,36 @@
 //! Claude Code, in the bar. The item shows when sessions run, and counts the ones waiting for
 //! you. A permission prompt, a question or a plan to approve becomes a notification you can
 //! answer, and a session that finishes its turn says so and takes a reply. The popover lists the
-//! sessions, and each one's page has its prompts, its last reply and a field to message it.
+//! sessions; each one opens its conversation, live, with what it's doing now, what it asks, and a
+//! field to answer it.
 //!
-//! Three sources, each for what only it knows:
+//! Four sources, each for what only it knows:
 //! - `~/.claude/sessions/` ([`sessions`]): which sessions run and whether they wait for you.
 //! - The eave plugin for Claude Code ([`hooks`]): what they ask, and the answers.
+//! - Each session's transcript ([`transcript`]): the conversation, while it shows.
 //! - Each session's messaging socket ([`peer`]): what you type to them.
+//!
+//! Notifications go over the session bus like any app's ([`notify`]).
 
 mod hooks;
+mod notify;
 mod peer;
 mod sessions;
 mod title;
+mod transcript;
 
+use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 
 use eave_api::time::{Duration, sleep};
-use eave_api::ui::{self, Item, Notice, Panel, Reply, Tone};
+use eave_api::ui::{self, Item, Panel, Tone};
 use eave_api::{Effect, Nudge, Registry, Subscription, Task, Widget};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use sessions::Status;
+use transcript::{Chat, Entry};
 
 pub fn register(registry: &mut Registry) {
     registry.widget::<Claude>("claude");
@@ -49,8 +57,6 @@ impl Default for Config {
 /// How long a session waits in the terminal before the bar says so, when no hook asked: a hook's
 /// prompt usually arrives with the dialog, and would say it better.
 const UNASKED: Duration = Duration::from_millis(1500);
-/// Notices that aren't prompts take keys from here up, so they never meet a prompt's id.
-const NOTE_KEYS: u64 = 1 << 48;
 
 pub struct Claude {
     config: Config,
@@ -60,14 +66,21 @@ pub struct Claude {
     sessions: Vec<Session>,
     /// Waiting for an answer, newest first.
     prompts: Vec<Prompt>,
-    /// Notices that aren't prompts, newest first.
+    /// Notifications that aren't prompts, newest first.
     notes: Vec<Note>,
     next_note: u64,
+    /// The notifications on the bus: what each is for, and its id once the server gave it.
+    posted: Vec<Posted>,
+    /// Each session's permission mode before it went into plan mode, from its hooks: approving a
+    /// plan goes back to it, as the terminal does.
+    modes: HashMap<String, String>,
     page: Page,
-    /// What's being typed, and where it goes.
+    /// What's being typed in the popover, and where it goes.
     draft: Option<(Target, String)>,
     /// Whether the popover shows.
     open: bool,
+    /// The conversation of the session whose chat shows.
+    chat: Option<(String, Chat)>,
 }
 
 struct Session {
@@ -83,14 +96,14 @@ struct Session {
 }
 
 struct Prompt {
-    /// The hook server's id for it, and its notice's key.
+    /// The hook server's id for it.
     id: u64,
     session: String,
     cwd: String,
     ask: Ask,
     /// The session file said it waits, so it no longer waiting means this was answered elsewhere.
     seen_waiting: bool,
-    /// Its notice was closed. It still waits, in the popover.
+    /// Its notification was dismissed. It still waits, in the popover.
     hidden: bool,
 }
 
@@ -113,7 +126,13 @@ enum Ask {
         at: usize,
     },
     /// ExitPlanMode: a plan to approve.
-    Plan { plan: String },
+    Plan {
+        plan: String,
+        /// The tool's input, given back when approving: Claude Code wants it for this tool.
+        input: Value,
+        /// What the hook suggested, in case it offers a mode to go on in.
+        suggestions: Value,
+    },
 }
 
 struct Question {
@@ -137,10 +156,27 @@ enum NoteKind {
     Waiting(String),
 }
 
+/// What a notification on the bus is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    Prompt(u64),
+    Note(u64),
+}
+
+struct Posted {
+    key: Key,
+    /// The server's id for it, once it answered.
+    id: Option<u32>,
+    /// No longer wanted, before its id came: close it once it does.
+    gone: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Page {
     Sessions,
-    Session(String),
+    /// A session's conversation.
+    Chat(String),
+    /// A prompt from a session not in the list, like one run with `-p`.
     Prompt(u64),
 }
 
@@ -156,23 +192,25 @@ pub enum Target {
 pub enum Message {
     Hooks(hooks::Event),
     Sessions(Vec<sessions::Live>),
+    /// The notification server said something about a notification.
+    Signal(notify::Signal),
+    /// A notification went up, with this id, or couldn't.
+    Posted(Key, Option<u32>),
+    /// The conversation of a session, read again.
+    Chat(String, Chat),
     Allow(u64),
     AlwaysAllow(u64),
     Deny(u64),
+    /// Approves a plan.
+    Approve(u64),
     /// An option of a question: prompt, question, option.
     Pick(u64, usize, usize),
     /// Sends the options picked.
     Submit(u64),
     /// Shows another question of a prompt.
     Turn(u64, usize),
-    StartReply(Target),
     Draft(Target, String),
     SendReply,
-    CancelReply,
-    /// Closes a prompt's notice; it still waits in the popover.
-    Hide(u64),
-    Expired(u64),
-    Dismiss(u64),
     /// Goes to a page, opening the popover if it's closed.
     Show(Page),
     Back,
@@ -195,18 +233,101 @@ impl Widget for Claude {
             sessions: Vec::new(),
             prompts: Vec::new(),
             notes: Vec::new(),
-            next_note: NOTE_KEYS,
+            next_note: 1,
+            posted: Vec::new(),
+            modes: HashMap::new(),
             page: Page::Sessions,
             draft: None,
             open: false,
+            chat: None,
         };
         (claude, Task::none())
     }
 
     fn update(&mut self, message: Message) -> Effect<Message> {
+        let effect = self.handle(message);
+        let post = self.post();
+        effect.and_task(post)
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let mut subscriptions = vec![
+            Subscription::run(hooks::watch).map(Message::Hooks),
+            sessions::watch().map(Message::Sessions),
+            Subscription::run(notify::signals).map(Message::Signal),
+        ];
+        // The conversation, only while it shows.
+        if let (true, Page::Chat(id)) = (self.open, &self.page)
+            && let Some(session) = self.session(id)
+            && let Some(config) = sessions::config_dir()
+        {
+            let path = sessions::transcript(&config, &session.cwd, id);
+            let data = (id.clone(), path, session.cwd.clone());
+            subscriptions.push(
+                Subscription::run_with(data, |(id, path, cwd)| {
+                    use futures_util::StreamExt;
+                    let id = id.clone();
+                    transcript::watch(path.clone(), cwd.clone()).map(move |chat| (id.clone(), chat))
+                })
+                .map(|(id, chat)| Message::Chat(id, chat)),
+            );
+        }
+        Subscription::batch(subscriptions)
+    }
+
+    fn item(&self) -> Item<Message> {
+        if self.sessions.is_empty() && self.prompts.is_empty() {
+            return Item::hidden();
+        }
+        let waiting = self.waiting();
+        let busy = self.sessions.iter().any(|s| s.status == Status::Busy);
+        // Claude's mark, in its orange. Dimmed while nothing works or waits. Not animated while
+        // busy: sessions are busy for most of the day, and an icon that keeps moving keeps the
+        // bar drawing (about 10% CPU).
+        let logo = ui::image(include_bytes!("../assets/claude.svg"));
+        let logo = if busy || waiting > 0 {
+            logo
+        } else {
+            logo.tone(Tone::Dim)
+        };
+        let content = match waiting {
+            0 => logo,
+            waiting => ui::row([
+                logo,
+                ui::counter(waiting.min(99) as i64, 0..=99, "").tone(Tone::Warning),
+            ]),
+        };
+        Item::new(content)
+    }
+
+    fn popover(&self) -> Option<Panel<Message>> {
+        let panel = match &self.page {
+            Page::Chat(id) => self
+                .session(id)
+                .map(|session| Panel::new(self.chat_page(session)).wide()),
+            Page::Prompt(id) => self
+                .prompt(*id)
+                .map(|prompt| Panel::new(self.prompt_page(prompt)).wide()),
+            Page::Sessions => None,
+        };
+        let panel = panel.unwrap_or_else(|| Panel::new(self.sessions_page()));
+        Some(panel.on_open(Message::Opened).on_close(Message::Closed))
+    }
+}
+
+impl Claude {
+    fn handle(&mut self, message: Message) -> Effect<Message> {
         match message {
             Message::Hooks(event) => self.heard(event),
             Message::Sessions(live) => self.sessions_changed(live),
+            Message::Signal(signal) => self.signalled(signal),
+            Message::Posted(key, id) => self.posted(key, id),
+            Message::Chat(id, chat) => {
+                if self.page == Page::Chat(id.clone()) {
+                    self.chat = Some((id, chat));
+                }
+                Effect::none()
+            }
             Message::Allow(id) => self.decide(id, json!({"behavior": "allow"})),
             Message::AlwaysAllow(id) => {
                 let always = self.prompt(id).and_then(|prompt| match &prompt.ask {
@@ -226,6 +347,7 @@ impl Widget for Claude {
                 id,
                 json!({"behavior": "deny", "message": "The user said no.", "interrupt": true}),
             ),
+            Message::Approve(id) => self.approve(id),
             Message::Pick(id, question, option) => self.pick(id, question, option),
             Message::Submit(id) => self.submit(id),
             Message::Turn(id, question) => {
@@ -241,54 +363,32 @@ impl Widget for Claude {
                 self.drop_draft(&Target::Prompt(id));
                 Effect::none()
             }
-            Message::StartReply(target) => {
-                self.draft = Some((target, String::new()));
-                Effect::none()
-            }
             Message::Draft(target, text) => {
                 self.draft = Some((target, text));
                 Effect::none()
             }
-            Message::SendReply => self.send_reply(),
-            Message::CancelReply => {
-                self.draft = None;
-                Effect::none()
-            }
-            Message::Hide(id) => {
-                if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == id) {
-                    prompt.hidden = true;
+            Message::SendReply => {
+                let Some((target, text)) = self.draft.take() else {
+                    return Effect::none();
+                };
+                if text.trim().is_empty() {
+                    self.draft = Some((target, text));
+                    return Effect::none();
                 }
-                self.drop_draft(&Target::Prompt(id));
-                Effect::none()
+                self.answer(target, text)
             }
-            Message::Expired(key) | Message::Dismiss(key) => {
-                if let Some(note) = self.notes.iter().find(|note| note.key == key) {
-                    let session = Target::Session(note.session.clone());
-                    self.drop_draft(&session);
-                }
-                self.notes.retain(|note| note.key != key);
-                Effect::none()
-            }
-            Message::Show(page) => {
-                self.page = page;
-                // Asking the host to open an open popover closes it first, and closing resets
-                // the page: within the popover, just change pages.
-                if self.open {
-                    Effect::none()
-                } else {
-                    Effect::none().open_popover()
-                }
-            }
+            Message::Show(page) => self.show(page),
             Message::Back => {
                 self.page = match &self.page {
                     Page::Prompt(id) => self
                         .prompt(*id)
                         .map(|prompt| prompt.session.clone())
                         .filter(|session| self.session(session).is_some())
-                        .map_or(Page::Sessions, Page::Session),
+                        .map_or(Page::Sessions, Page::Chat),
                     _ => Page::Sessions,
                 };
                 self.draft = None;
+                self.chat = None;
                 Effect::none()
             }
             Message::Focus(id) => {
@@ -334,69 +434,38 @@ impl Widget for Claude {
                 self.open = false;
                 self.page = Page::Sessions;
                 self.draft = None;
+                self.chat = None;
                 Effect::none()
             }
         }
     }
 
-    fn subscription(&self) -> Subscription<Message> {
-        Subscription::batch([
-            Subscription::run(hooks::watch).map(Message::Hooks),
-            sessions::watch().map(Message::Sessions),
-        ])
-    }
-
-    fn item(&self) -> Item<Message> {
-        if self.sessions.is_empty() && self.prompts.is_empty() {
-            return Item::hidden();
+    /// Goes to `page`, opening the popover if it's closed. A prompt of a session in the list
+    /// shows in that session's chat.
+    fn show(&mut self, page: Page) -> Effect<Message> {
+        let page = match page {
+            Page::Prompt(id) => match self.prompt(id) {
+                Some(prompt) if self.session(&prompt.session).is_some() => {
+                    Page::Chat(prompt.session.clone())
+                }
+                _ => Page::Prompt(id),
+            },
+            page => page,
+        };
+        if self.page != page {
+            self.chat = None;
+            self.draft = None;
         }
-        let waiting = self.waiting();
-        let busy = self.sessions.iter().any(|s| s.status == Status::Busy);
-        // Claude's mark, in its orange. Dimmed while nothing works or waits. Not animated while
-        // busy: sessions are busy for most of the day, and an icon that keeps moving keeps the
-        // bar drawing (about 10% CPU).
-        let logo = ui::image(include_bytes!("../assets/claude.svg"));
-        let logo = if busy || waiting > 0 {
-            logo
+        self.page = page;
+        // Asking the host to open an open popover closes it first, and closing resets the page:
+        // within the popover, just change pages.
+        if self.open {
+            Effect::none()
         } else {
-            logo.tone(Tone::Dim)
-        };
-        let content = match waiting {
-            0 => logo,
-            waiting => ui::row([
-                logo,
-                ui::counter(waiting.min(99) as i64, 0..=99, "").tone(Tone::Warning),
-            ]),
-        };
-        Item::new(content)
+            Effect::none().open_popover()
+        }
     }
 
-    fn popover(&self) -> Option<Panel<Message>> {
-        let page = match &self.page {
-            Page::Session(id) => self.session(id).map(|session| self.session_page(session)),
-            Page::Prompt(id) => self.prompt(*id).map(|prompt| self.prompt_page(prompt)),
-            Page::Sessions => None,
-        };
-        let content = page.unwrap_or_else(|| self.sessions_page());
-        Some(
-            Panel::new(content)
-                .on_open(Message::Opened)
-                .on_close(Message::Closed),
-        )
-    }
-
-    fn notices(&self) -> Vec<Notice<Message>> {
-        let prompts = self
-            .prompts
-            .iter()
-            .filter(|prompt| !prompt.hidden)
-            .map(|prompt| self.prompt_notice(prompt));
-        let notes = self.notes.iter().map(|note| self.note_notice(note));
-        prompts.chain(notes).collect()
-    }
-}
-
-impl Claude {
     fn heard(&mut self, event: hooks::Event) -> Effect<Message> {
         match event {
             hooks::Event::Listening => self.failed = None,
@@ -412,6 +481,7 @@ impl Claude {
     }
 
     fn hooked(&mut self, hook: hooks::Hook) {
+        self.remember_mode(&hook);
         let id = hook.session_id;
         match hook.hook_event_name.as_str() {
             "UserPromptSubmit" => {
@@ -452,7 +522,16 @@ impl Claude {
         }
     }
 
+    /// Keeps the mode a session works in outside plan mode, to go back to after a plan.
+    fn remember_mode(&mut self, hook: &hooks::Hook) {
+        let mode = hook.permission_mode.as_str();
+        if !mode.is_empty() && mode != "plan" && !hook.session_id.is_empty() {
+            self.modes.insert(hook.session_id.clone(), mode.to_string());
+        }
+    }
+
     fn asked(&mut self, id: u64, hook: hooks::Hook) -> Effect<Message> {
+        self.remember_mode(&hook);
         let ask = ask(&hook);
         let session = hook.session_id;
         self.notes
@@ -504,6 +583,7 @@ impl Claude {
         for gone in old {
             self.settle_session(&gone.id);
             self.notes.retain(|note| note.session != gone.id);
+            self.modes.remove(&gone.id);
         }
         // A prompt whose session stopped waiting was answered in the terminal.
         let mut stale = Vec::new();
@@ -530,8 +610,9 @@ impl Claude {
                     .iter()
                     .any(|s| s.id == note.session && matches!(s.status, Status::Waiting(_)))
         });
-        if matches!(&self.page, Page::Session(id) if self.session(id).is_none()) {
+        if matches!(&self.page, Page::Chat(id) if self.session(id).is_none()) {
             self.page = Page::Sessions;
+            self.chat = None;
         }
         Effect::task(Task::batch(unasked.into_iter().map(|id| {
             Task::future(async move {
@@ -544,10 +625,46 @@ impl Claude {
     /// Answers prompt `id` with `decision`, and lets it go.
     fn decide(&mut self, id: u64, decision: Value) -> Effect<Message> {
         if !hooks::answer(id, hooks::decision(decision)) {
-            eprintln!("eave-claude: that prompt was already answered");
+            eprintln!("eave-claude: prompt {id} was already answered, or Claude stopped waiting");
         }
         self.forget(id);
         Effect::none()
+    }
+
+    /// Approves plan `id`: Claude Code wants its input back for this tool, and goes on in the
+    /// mode the session was in before planning, as when you approve in the terminal.
+    fn approve(&mut self, id: u64) -> Effect<Message> {
+        let Some(prompt) = self.prompt(id) else {
+            return Effect::none();
+        };
+        let Ask::Plan {
+            input, suggestions, ..
+        } = &prompt.ask
+        else {
+            return self.decide(id, json!({"behavior": "allow"}));
+        };
+        let suggested = suggestions
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find_map(|rule| {
+                (rule["type"] == "setMode")
+                    .then(|| rule["mode"].as_str())
+                    .flatten()
+                    .filter(|mode| *mode != "plan")
+            });
+        let mode = self
+            .modes
+            .get(&prompt.session)
+            .map(String::as_str)
+            .or(suggested)
+            .unwrap_or("default");
+        let decision = json!({
+            "behavior": "allow",
+            "updatedInput": input,
+            "updatedPermissions": [{"type": "setMode", "mode": mode, "destination": "session"}],
+        });
+        self.decide(id, decision)
     }
 
     fn pick(&mut self, id: u64, question: usize, option: usize) -> Effect<Message> {
@@ -652,13 +769,10 @@ impl Claude {
         self.decide(id, decision)
     }
 
-    fn send_reply(&mut self) -> Effect<Message> {
-        let Some((target, text)) = self.draft.take() else {
-            return Effect::none();
-        };
+    /// Sends `text`, typed in the popover or into a notification, where it goes.
+    fn answer(&mut self, target: Target, text: String) -> Effect<Message> {
         let text = text.trim().to_string();
         if text.is_empty() {
-            self.draft = Some((target, text));
             return Effect::none();
         }
         match target {
@@ -683,11 +797,7 @@ impl Claude {
                     }
                     Some(Ask::Question { .. }) | None => return Effect::none(),
                 };
-                let effect = self.decide(id, decision);
-                if self.page == Page::Prompt(id) {
-                    return self.update(Message::Back);
-                }
-                effect
+                self.decide(id, decision)
             }
             Target::Session(id) => {
                 let Some(session) = self.session(&id) else {
@@ -780,23 +890,16 @@ impl Claude {
         }
     }
 
-    fn draft(&self, target: &Target) -> Option<&str> {
+    fn draft(&self, target: &Target) -> &str {
         self.draft
             .as_ref()
             .filter(|(t, _)| t == target)
-            .map(|(_, text)| text.as_str())
+            .map_or("", |(_, text)| text.as_str())
     }
 
-    /// A field on a notice, if it's being typed into.
-    fn reply_field(&self, target: Target, placeholder: &str) -> Option<Reply<Message>> {
-        let draft = self.draft(&target)?.to_string();
-        Some(
-            Reply::new(placeholder, draft, move |text| {
-                Message::Draft(target.clone(), text)
-            })
-            .on_submit(Message::SendReply)
-            .on_cancel(Message::CancelReply),
-        )
+    /// The prompt a session waits on that the popover shows: the oldest.
+    fn pending(&self, session: &str) -> Option<&Prompt> {
+        self.prompts.iter().rev().find(|p| p.session == session)
     }
 }
 
@@ -819,39 +922,187 @@ impl Session {
     }
 }
 
-// The notices.
+// The notifications.
 impl Claude {
-    fn prompt_notice(&self, prompt: &Prompt) -> Notice<Message> {
-        let id = prompt.id;
-        let label = self.label(&prompt.session, &prompt.cwd);
-        let target = Target::Prompt(id);
-        let notice = |summary: &str| {
-            Notice::new(id, summary)
-                .app(&label)
-                .app_icon("claude")
-                .on_press(Message::Show(Page::Prompt(id)))
-                .on_dismiss(Message::Hide(id))
+    /// The notifications that should show, by what they're for.
+    fn wanted(&self) -> Vec<(Key, notify::Note)> {
+        let prompts = self
+            .prompts
+            .iter()
+            .filter(|prompt| !prompt.hidden)
+            .map(|prompt| (Key::Prompt(prompt.id), self.prompt_note(prompt)));
+        let notes = self
+            .notes
+            .iter()
+            .map(|note| (Key::Note(note.key), self.note_note(note)));
+        prompts.chain(notes).collect()
+    }
+
+    /// Brings the notifications on the bus in line with [`wanted`](Self::wanted): new ones go up,
+    /// ones no longer wanted are closed.
+    fn post(&mut self) -> Task<Message> {
+        let wanted = self.wanted();
+        let mut tasks = Vec::new();
+        self.posted.retain_mut(|posted| {
+            if wanted.iter().any(|(key, _)| *key == posted.key) {
+                return true;
+            }
+            match posted.id {
+                Some(id) => {
+                    tasks.push(close(id));
+                    false
+                }
+                None => {
+                    posted.gone = true;
+                    true
+                }
+            }
+        });
+        for (key, note) in wanted {
+            if self.posted.iter().any(|posted| posted.key == key) {
+                continue;
+            }
+            self.posted.push(Posted {
+                key,
+                id: None,
+                gone: false,
+            });
+            tasks.push(Task::future(async move {
+                match notify::send(note, 0).await {
+                    Ok(id) => Message::Posted(key, Some(id)),
+                    Err(error) => {
+                        eprintln!("eave-claude: can't show a notification: {error}");
+                        Message::Posted(key, None)
+                    }
+                }
+            }));
+        }
+        Task::batch(tasks)
+    }
+
+    fn posted(&mut self, key: Key, id: Option<u32>) -> Effect<Message> {
+        let Some(at) = self.posted.iter().position(|posted| posted.key == key) else {
+            return Effect::none();
         };
-        match &prompt.ask {
-            Ask::Permission { tool, what, .. } => {
-                let notice = notice(&format!("Allow {tool}?"))
-                    .body(what)
-                    .action("Allow", Message::Allow(id))
-                    .action("Deny", Message::Deny(id));
-                match self.reply_field(target.clone(), "Or tell Claude what to do instead") {
-                    Some(field) => notice.reply(field),
-                    None => notice.action("Instead…", Message::StartReply(target)),
+        match id {
+            Some(id) if self.posted[at].gone => {
+                self.posted.remove(at);
+                Effect::task(close(id))
+            }
+            // Couldn't: left without an id, so it isn't tried again and again.
+            id => {
+                self.posted[at].id = id;
+                Effect::none()
+            }
+        }
+    }
+
+    fn signalled(&mut self, signal: notify::Signal) -> Effect<Message> {
+        let id = match &signal {
+            notify::Signal::Action(id, _)
+            | notify::Signal::Replied(id, _)
+            | notify::Signal::Closed(id, _) => *id,
+        };
+        let Some(at) = self.posted.iter().position(|posted| posted.id == Some(id)) else {
+            return Effect::none();
+        };
+        let key = self.posted[at].key;
+        match signal {
+            notify::Signal::Action(_, action) => {
+                // The server takes it away after an action.
+                self.posted.remove(at);
+                let effect = self.acted(key, &action);
+                self.hidden(key);
+                effect
+            }
+            notify::Signal::Replied(_, text) => {
+                self.posted.remove(at);
+                let target = match key {
+                    Key::Prompt(prompt) => Some(Target::Prompt(prompt)),
+                    Key::Note(_) => self.note_session(key).map(Target::Session),
+                };
+                self.hidden(key);
+                match target {
+                    Some(target) => self.answer(target, text),
+                    None => Effect::none(),
                 }
             }
-            Ask::Plan { plan } => {
-                let notice = notice("Plan ready")
-                    .body(plan)
-                    .action("Approve", Message::Allow(id));
-                match self.reply_field(target.clone(), "What should change?") {
-                    Some(field) => notice.reply(field),
-                    None => notice.action("Change…", Message::StartReply(target)),
+            notify::Signal::Closed(..) => {
+                self.posted.remove(at);
+                self.hidden(key);
+                Effect::none()
+            }
+        }
+    }
+
+    /// Its notification is gone: a prompt still waits in the popover, a note is done with.
+    fn hidden(&mut self, key: Key) {
+        match key {
+            Key::Prompt(id) => {
+                if let Some(prompt) = self.prompts.iter_mut().find(|p| p.id == id) {
+                    prompt.hidden = true;
                 }
             }
+            Key::Note(note) => self.notes.retain(|n| n.key != note),
+        }
+    }
+
+    /// An action picked on the notification for `key`.
+    fn acted(&mut self, key: Key, action: &str) -> Effect<Message> {
+        match key {
+            Key::Prompt(id) => match action {
+                "allow" => self.handle(Message::Allow(id)),
+                "deny" => self.handle(Message::Deny(id)),
+                "approve" => self.approve(id),
+                "default" | "answer" => self.show(Page::Prompt(id)),
+                pick => match pick.strip_prefix("pick:").and_then(|n| n.parse().ok()) {
+                    Some(option) => self.pick(id, 0, option),
+                    None => Effect::none(),
+                },
+            },
+            Key::Note(_) => {
+                let Some(session) = self.note_session(key) else {
+                    return Effect::none();
+                };
+                match action {
+                    "show" => self.handle(Message::Focus(session)),
+                    _ if self.session(&session).is_some() => self.show(Page::Chat(session)),
+                    _ => Effect::none(),
+                }
+            }
+        }
+    }
+
+    /// The session a note is about.
+    fn note_session(&self, key: Key) -> Option<String> {
+        let Key::Note(note) = key else {
+            return None;
+        };
+        self.notes
+            .iter()
+            .find(|n| n.key == note)
+            .map(|n| n.session.clone())
+    }
+
+    fn prompt_note(&self, prompt: &Prompt) -> notify::Note {
+        let label = self.label(&prompt.session, &prompt.cwd);
+        let open = ("default".to_string(), "Open".to_string());
+        let (summary, body, mut actions, reply) = match &prompt.ask {
+            Ask::Permission { tool, what, .. } => (
+                format!("Allow {tool}?"),
+                code(what),
+                vec![
+                    ("allow".into(), "Allow".into()),
+                    ("deny".into(), "Deny".into()),
+                ],
+                Some("Or tell Claude what to do instead"),
+            ),
+            Ask::Plan { plan, .. } => (
+                "Plan ready".into(),
+                plan.clone(),
+                vec![("approve".into(), "Approve".into())],
+                Some("What should change?"),
+            ),
             Ask::Question { questions, .. } => {
                 let first = &questions[0];
                 if questions.len() > 1 || !fits(first) {
@@ -859,73 +1110,96 @@ impl Claude {
                         1 => question_title(first),
                         n => format!("{n} questions"),
                     };
-                    return notice(&summary)
-                        .body(&first.text)
-                        .action("Answer…", Message::Show(Page::Prompt(id)));
-                }
-                let mut notice = notice(&question_title(first)).body(&first.text);
-                for (option, (choice, _)) in first.options.iter().enumerate() {
-                    notice = notice.action(choice, Message::Pick(id, 0, option));
-                }
-                match self.reply_field(target.clone(), "Your answer") {
-                    Some(field) => notice.reply(field),
-                    None => notice.action("Other…", Message::StartReply(target)),
+                    (
+                        summary,
+                        first.text.clone(),
+                        vec![("answer".into(), "Answer…".into())],
+                        None,
+                    )
+                } else {
+                    let options = first
+                        .options
+                        .iter()
+                        .enumerate()
+                        .map(|(option, (choice, _))| (format!("pick:{option}"), choice.clone()))
+                        .collect();
+                    (
+                        question_title(first),
+                        first.text.clone(),
+                        options,
+                        Some("Your answer"),
+                    )
                 }
             }
+        };
+        actions.push(open);
+        notify::Note {
+            app: label,
+            summary,
+            body,
+            actions,
+            reply: reply.map(str::to_string),
+            seconds: None,
         }
     }
 
-    fn note_notice(&self, note: &Note) -> Notice<Message> {
-        let key = note.key;
+    fn note_note(&self, note: &Note) -> notify::Note {
         let session = self.session(&note.session);
         let label = session.map_or_else(|| "Claude".into(), Session::label);
-        let notice = |summary: &str| {
-            Notice::new(key, summary)
-                .app(&label)
-                .app_icon("claude")
-                .on_press(Message::Focus(note.session.clone()))
-                .on_dismiss(Message::Dismiss(key))
-        };
-        match &note.kind {
+        let mut actions = vec![("default".to_string(), "Open".to_string())];
+        let (summary, body, reply, seconds) = match &note.kind {
             NoteKind::Done(reply) => {
-                let notice = notice("Done");
-                let notice = if reply.is_empty() {
-                    notice
-                } else {
-                    notice.body(reply)
-                };
-                let target = Target::Session(note.session.clone());
-                if session.is_none_or(|s| s.socket.is_none()) {
-                    return notice.expires(self.timeout(), Message::Expired(key));
-                }
-                match self.reply_field(target.clone(), "Message Claude") {
-                    Some(field) => notice.reply(field),
-                    None => notice
-                        .action("Reply", Message::StartReply(target))
-                        .expires(self.timeout(), Message::Expired(key)),
-                }
+                let answerable = session.is_some_and(|s| s.socket.is_some());
+                (
+                    "Done",
+                    reply.clone(),
+                    answerable.then(|| "Message Claude".to_string()),
+                    Some(self.config.timeout.max(1)),
+                )
             }
-            NoteKind::Failed(error) => {
-                let notice = notice("Stopped with an error");
-                if error.is_empty() {
-                    notice
-                } else {
-                    notice.body(error)
-                }
+            NoteKind::Failed(error) => ("Stopped with an error", error.clone(), None, None),
+            NoteKind::Waiting(what) => {
+                actions.insert(0, ("show".into(), "Show".into()));
+                ("Waiting for you in the terminal", what.clone(), None, None)
             }
-            NoteKind::Waiting(what) => notice("Waiting for you in the terminal")
-                .body(what)
-                .action("Show", Message::Focus(note.session.clone())),
+        };
+        notify::Note {
+            app: label,
+            summary: summary.into(),
+            body,
+            actions,
+            reply,
+            seconds,
         }
     }
+}
 
-    fn timeout(&self) -> Duration {
-        Duration::from_secs(self.config.timeout.max(1))
+/// Closes the notification `id`.
+fn close(id: u32) -> Task<Message> {
+    Task::future(async move {
+        if let Err(error) = notify::close(id).await {
+            eprintln!("eave-claude: can't close a notification: {error}");
+        }
+    })
+    .discard()
+}
+
+/// `what` a tool will do, as Markdown code: one line inline, more in a block.
+fn code(what: &str) -> String {
+    if what.is_empty() {
+        return String::new();
+    }
+    let fence = if what.contains("```") { "~~~~" } else { "```" };
+    if what.contains('\n') || what.contains('`') {
+        format!("{fence}\n{what}\n{fence}")
+    } else {
+        format!("`{what}`")
     }
 }
 
 // The popover.
 impl Claude {
+    /// Every session, with what it's doing: a click opens its chat.
     fn sessions_page(&self) -> ui::Node<Message> {
         let mut rows = vec![ui::header("Claude Code")];
         if let Some(error) = &self.failed {
@@ -942,7 +1216,7 @@ impl Claude {
                         directory(&session.cwd),
                         session.status_text()
                     ))
-                    .on_press(Message::Show(Page::Session(session.id.clone())));
+                    .on_press(Message::Show(Page::Chat(session.id.clone())));
                 if asked || matches!(session.status, Status::Waiting(_)) {
                     row.trailing(ui::badge("needs you").tone(Tone::Warning))
                 } else {
@@ -950,7 +1224,6 @@ impl Claude {
                 }
             })));
         }
-        // Prompts from sessions not in the list, like ones run with `-p`.
         let strays: Vec<_> = self
             .prompts
             .iter()
@@ -958,82 +1231,109 @@ impl Claude {
             .collect();
         if !strays.is_empty() {
             rows.push(ui::section("Other prompts"));
-            rows.push(ui::list(strays.into_iter().map(|p| self.prompt_row(p))));
+            rows.push(ui::list(strays.into_iter().map(|p| {
+                let (title, subtitle) = match &p.ask {
+                    Ask::Permission { tool, what, .. } => (format!("Allow {tool}?"), what.clone()),
+                    Ask::Plan { plan, .. } => ("Plan ready".into(), plan.clone()),
+                    Ask::Question { questions, .. } => {
+                        (question_title(&questions[0]), questions[0].text.clone())
+                    }
+                };
+                ui::list_item(title)
+                    .subtitle(subtitle.lines().next().unwrap_or_default())
+                    .on_press(Message::Show(Page::Prompt(p.id)))
+            })));
         }
         ui::column(rows)
     }
 
-    fn session_page(&self, session: &Session) -> ui::Node<Message> {
+    /// A session's conversation, what it's doing now, what it asks, and a field to answer.
+    fn chat_page(&self, session: &Session) -> ui::Node<Message> {
+        let header = ui::header(session.label())
+            .on_back(Message::Back)
+            .trailing(ui::button(
+                ui::label("Show"),
+                Message::Focus(session.id.clone()),
+            ));
+        let chat = self
+            .chat
+            .as_ref()
+            .filter(|(id, _)| *id == session.id)
+            .map(|(_, chat)| chat);
+        let pending = self.pending(&session.id);
+        let mut conversation = match chat {
+            Some(chat) => conversation(&chat.entries),
+            None => vec![ui::label("…").tone(Tone::Dim)],
+        };
+        // A plan to approve is read with the rest.
+        if let Some(Ask::Plan { plan, .. }) = pending.map(|p| &p.ask) {
+            conversation.push(ui::section("Plan"));
+            conversation.push(ui::markdown(plan));
+        }
         let mut rows = vec![
-            ui::header(session.label())
-                .on_back(Message::Back)
-                .trailing(ui::button(
-                    ui::label("Show"),
-                    Message::Focus(session.id.clone()),
-                )),
-            ui::detail("Folder", ui::label(home(&session.cwd))),
-            ui::detail("Status", ui::label(session.status_text())),
+            header,
+            ui::scroll(ui::column(conversation)).bottom(),
+            activity(session, chat),
         ];
-        let prompts: Vec<_> = self
-            .prompts
-            .iter()
-            .filter(|p| p.session == session.id)
-            .collect();
-        if !prompts.is_empty() {
-            rows.push(ui::section("Needs you"));
-            rows.push(ui::list(prompts.into_iter().map(|p| self.prompt_row(p))));
-        }
-        if let Some(reply) = &session.last_reply {
-            rows.push(ui::section("Last reply"));
-            rows.push(ui::label(shorten(reply, 600)).tone(Tone::Dim));
-        }
-        if session.socket.is_some() {
-            let target = Target::Session(session.id.clone());
-            let draft = self.draft(&target).unwrap_or_default().to_string();
-            rows.push(ui::separator());
-            rows.push(
-                ui::text_input("Message Claude", draft, move |text| {
-                    Message::Draft(target.clone(), text)
-                })
-                .on_submit(Message::SendReply)
-                .trailing(ui::button(ui::icon(ui::Icon::Forward), Message::SendReply)),
-            );
+        let target = match pending {
+            Some(prompt) => {
+                rows.push(ui::separator());
+                rows.extend(self.prompt_controls(prompt, false));
+                Some(Target::Prompt(prompt.id))
+            }
+            None => session
+                .socket
+                .is_some()
+                .then(|| Target::Session(session.id.clone())),
+        };
+        if let Some(target) = target {
+            let placeholder = match pending.map(|p| &p.ask) {
+                Some(Ask::Permission { .. }) => "Or tell Claude what to do instead",
+                Some(Ask::Plan { .. }) => "What should change?",
+                Some(Ask::Question { .. }) => "Or answer in your own words",
+                None => "Message Claude",
+            };
+            rows.push(self.composer(target, placeholder));
         }
         ui::column(rows)
     }
 
-    fn prompt_row(&self, prompt: &Prompt) -> ui::Node<Message> {
-        let (title, subtitle) = match &prompt.ask {
-            Ask::Permission { tool, what, .. } => (format!("Allow {tool}?"), what.clone()),
-            Ask::Plan { plan } => ("Plan ready".into(), plan.clone()),
-            Ask::Question { questions, .. } => {
-                (question_title(&questions[0]), questions[0].text.clone())
-            }
-        };
-        let subtitle = subtitle.lines().next().unwrap_or_default().to_string();
-        ui::list_item(title)
-            .subtitle(subtitle)
-            .on_press(Message::Show(Page::Prompt(prompt.id)))
-    }
-
+    /// A prompt from a session not in the list.
     fn prompt_page(&self, prompt: &Prompt) -> ui::Node<Message> {
-        let id = prompt.id;
-        let target = Target::Prompt(id);
-        let draft = self.draft(&target).unwrap_or_default().to_string();
-        let field = |placeholder: &str| {
-            let target = target.clone();
-            ui::text_input(placeholder, draft.clone(), move |text| {
-                Message::Draft(target.clone(), text)
-            })
-            .on_submit(Message::SendReply)
-            .trailing(ui::button(ui::icon(ui::Icon::Forward), Message::SendReply))
-        };
         let mut rows =
             vec![ui::header(self.label(&prompt.session, &prompt.cwd)).on_back(Message::Back)];
+        if let Ask::Plan { plan, .. } = &prompt.ask {
+            rows.push(ui::scroll(ui::markdown(plan)));
+        }
+        rows.extend(self.prompt_controls(prompt, true));
+        let placeholder = match &prompt.ask {
+            Ask::Permission { .. } => "Or tell Claude what to do instead",
+            Ask::Plan { .. } => "What should change?",
+            Ask::Question { .. } => "Or answer in your own words",
+        };
+        rows.push(self.composer(Target::Prompt(prompt.id), placeholder));
+        ui::column(rows)
+    }
+
+    fn composer(&self, target: Target, placeholder: &str) -> ui::Node<Message> {
+        let draft = self.draft(&target).to_string();
+        ui::text_area(placeholder, draft, move |text| {
+            Message::Draft(target.clone(), text)
+        })
+        .on_submit(Message::SendReply)
+        .trailing(ui::button(ui::icon(ui::Icon::Forward), Message::SendReply))
+    }
+
+    /// What a prompt asks, and its buttons.
+    fn prompt_controls(&self, prompt: &Prompt, alone: bool) -> Vec<ui::Node<Message>> {
+        let id = prompt.id;
+        let mut rows = Vec::new();
         match &prompt.ask {
             Ask::Permission { tool, what, always } => {
-                rows.push(ui::heading(format!("Allow {tool}?")));
-                rows.push(ui::label(shorten(what, 800)).tone(Tone::Dim));
+                rows.push(ui::section(format!("Allow {tool}?")));
+                if !what.is_empty() {
+                    rows.push(ui::markdown(code(what)));
+                }
                 rows.push(ui::grid(
                     2,
                     [
@@ -1047,13 +1347,12 @@ impl Claude {
                         Message::AlwaysAllow(id),
                     ));
                 }
-                rows.push(field("Or tell Claude what to do instead"));
             }
-            Ask::Plan { plan } => {
-                rows.push(ui::heading("Plan ready"));
-                rows.push(ui::label(shorten(plan, 1200)).tone(Tone::Dim));
-                rows.push(ui::button(ui::label("Approve"), Message::Allow(id)).prominent());
-                rows.push(field("What should change?"));
+            Ask::Plan { .. } => {
+                if alone {
+                    rows.push(ui::section("Plan ready"));
+                }
+                rows.push(ui::button(ui::label("Approve"), Message::Approve(id)).prominent());
             }
             Ask::Question {
                 questions,
@@ -1085,7 +1384,7 @@ impl Claude {
                     section = section.trailing(ui::row(steps));
                 }
                 rows.push(section);
-                rows.push(ui::label(&question.text));
+                rows.push(ui::markdown(&question.text));
                 rows.push(ui::list(question.options.iter().enumerate().map(
                     |(option, (choice, description))| {
                         let row = ui::list_item(choice)
@@ -1101,15 +1400,100 @@ impl Claude {
                 if let Some(own) = &own[index] {
                     rows.push(ui::label(format!("Your answer: {own}")).tone(Tone::Accent));
                 }
-                rows.push(field("Or answer in your own words"));
                 let all = (0..count).all(|q| !picks[q].is_empty() || own[q].is_some());
                 if (count > 1 || question.multiple) && (all || index + 1 == count) {
                     rows.push(ui::button(ui::label("Send"), Message::Submit(id)).prominent());
                 }
             }
         }
-        ui::column(rows)
+        rows
     }
+}
+
+/// The conversation as nodes: who speaks, once per turn, then what they said and did.
+fn conversation(entries: &[Entry]) -> Vec<ui::Node<Message>> {
+    #[derive(PartialEq)]
+    enum Speaker {
+        You,
+        Claude,
+    }
+    let mut nodes = Vec::new();
+    let mut speaking = None;
+    let mut speaks = |nodes: &mut Vec<ui::Node<Message>>, speaker: Speaker| {
+        if speaking.as_ref() != Some(&speaker) {
+            let name = match speaker {
+                Speaker::You => ui::section("You"),
+                Speaker::Claude => ui::section("Claude"),
+            };
+            nodes.push(name);
+            speaking = Some(speaker);
+        }
+    };
+    for entry in entries {
+        match entry {
+            Entry::You(text) => {
+                speaks(&mut nodes, Speaker::You);
+                nodes.push(ui::markdown(text).tone(Tone::Accent));
+            }
+            Entry::Claude(text) => {
+                speaks(&mut nodes, Speaker::Claude);
+                nodes.push(ui::markdown(text));
+            }
+            Entry::Tool {
+                name,
+                what,
+                done,
+                failed,
+                ..
+            } => {
+                speaks(&mut nodes, Speaker::Claude);
+                let (icon, tone) = match (done, failed) {
+                    (_, true) => (ui::Icon::Close, Tone::Critical),
+                    (true, false) => (ui::Icon::Check, Tone::Dim),
+                    (false, false) => (ui::Icon::Forward, Tone::Accent),
+                };
+                let line = if what.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{name} · {}", first_line(what))
+                };
+                nodes.push(ui::row([ui::icon(icon), ui::label(line)]).tone(tone));
+            }
+            Entry::Aside(text) => nodes.push(ui::label(text).tone(Tone::Dim)),
+        }
+    }
+    if nodes.is_empty() {
+        nodes.push(ui::label("Nothing said yet").tone(Tone::Dim));
+    }
+    nodes
+}
+
+/// What the session is doing now, in a line.
+fn activity(session: &Session, chat: Option<&Chat>) -> ui::Node<Message> {
+    let running = chat.and_then(Chat::running);
+    let mut text = match (&session.status, running) {
+        (Status::Busy, Some((name, what))) if !what.is_empty() => {
+            format!("Working · {name}: {}", first_line(what))
+        }
+        (Status::Busy, Some((name, _))) => format!("Working · {name}"),
+        (Status::Busy, None) => "Working…".into(),
+        (Status::Waiting(_), _) => "Waiting for you".into(),
+        (Status::Shell, _) => "Idle, a shell runs".into(),
+        (Status::Idle, _) => "Idle".into(),
+    };
+    if chat.and_then(|chat| chat.mode.as_deref()) == Some("plan") {
+        text.push_str(" · plan mode");
+    }
+    let tone = match session.status {
+        Status::Busy => Tone::Accent,
+        Status::Waiting(_) => Tone::Warning,
+        _ => Tone::Dim,
+    };
+    ui::label(text).tone(tone)
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or_default()
 }
 
 /// What a permission prompt, a question or a plan asks, from its hook.
@@ -1137,6 +1521,8 @@ fn ask(hook: &hooks::Hook) -> Ask {
         "ExitPlanMode" => {
             return Ask::Plan {
                 plan: text(&input["plan"]).trim().to_string(),
+                input: input.clone(),
+                suggestions: hook.permission_suggestions.clone(),
             };
         }
         _ => {}
@@ -1197,7 +1583,7 @@ fn answered(input: &Value, answers: serde_json::Map<String, Value>) -> Value {
 }
 
 /// `mcp__server__tool` as `server: tool`; others as they are.
-fn tool_name(tool: &str) -> String {
+pub(crate) fn tool_name(tool: &str) -> String {
     match tool
         .strip_prefix("mcp__")
         .and_then(|rest| rest.split_once("__"))
@@ -1208,7 +1594,7 @@ fn tool_name(tool: &str) -> String {
 }
 
 /// What a tool is about to do, in a line or two.
-fn describe(tool: &str, input: &Value, cwd: &str) -> String {
+pub(crate) fn describe(tool: &str, input: &Value, cwd: &str) -> String {
     let path = |key: &str| relative(&text(&input[key]), cwd);
     let described = match tool {
         "Bash" => format!("$ {}", text(&input["command"])),
@@ -1266,7 +1652,7 @@ fn directory(cwd: &str) -> String {
     }
 }
 
-fn shorten(text: &str, max: usize) -> String {
+pub(crate) fn shorten(text: &str, max: usize) -> String {
     match text.char_indices().nth(max) {
         Some((at, _)) => format!("{}…", &text[..at]),
         None => text.into(),

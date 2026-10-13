@@ -11,14 +11,18 @@ repository = "https://github.com/eaveshell/eave-claude"
 [dependencies]
 # From crates.io. When eave-build compiles the plugin into a bar, it patches these to the eave it
 # builds, so the host and the plugin share one.
-eave-api = "0.1.1"
+eave-api = "0.1.2"
+# Notifications go over the session bus (eave's D-52), on the bar's shared connection. zbus is
+# already in the build through eave's other plugins.
+eave-dbus = "0.1"
 # Focuses the terminal a session runs in.
 eave-hyprland = "0.1"
 # The hook server's event stream. Already in the build through iced.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
-# Watches ~/.claude/sessions with inotify. Already in the build through the Wayland stack, and
+# Watches ~/.claude/sessions and the transcript of the chat showing with inotify, and wakes now
+# and then (poll) to notice the chat closed. Already in the build through the Wayland stack, and
 # what eave's own config watcher uses.
-rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+rustix = { version = "1", default-features = false, features = ["std", "fs", "event"] }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 # Hook payloads, session files and transcripts are JSON. Already in the build through eave-hyprland.
 serde_json = { version = "1", default-features = false, features = ["std"] }

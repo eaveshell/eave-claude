@@ -53,6 +53,8 @@ pub struct Hook {
     pub cwd: String,
     /// Set inside a subagent.
     pub agent_id: Option<String>,
+    /// The session's permission mode: `default`, `plan`, `acceptEdits`, `auto`…
+    pub permission_mode: String,
     /// UserPromptSubmit and SessionStart, once Claude has named the session.
     pub session_title: Option<String>,
     /// Stop and StopFailure.

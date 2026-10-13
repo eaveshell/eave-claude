@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use eave_api::ui::NoticeParts;
 use serde_json::{Value, json};
 
 use super::*;
@@ -58,20 +57,25 @@ fn decision(answer: &mut tokio::sync::oneshot::Receiver<String>) -> Value {
     body["hookSpecificOutput"]["decision"].clone()
 }
 
-fn notices(widget: &Claude) -> Vec<NoticeParts<Message>> {
-    widget
-        .notices()
-        .into_iter()
-        .map(Notice::into_parts)
-        .collect()
+fn notices(widget: &Claude) -> Vec<notify::Note> {
+    widget.wanted().into_iter().map(|(_, note)| note).collect()
 }
 
-fn labels(notice: &NoticeParts<Message>) -> Vec<&str> {
+fn labels(notice: &notify::Note) -> Vec<&str> {
     notice
         .actions
         .iter()
-        .map(|(label, _)| label.as_str())
+        .map(|(_, label)| label.as_str())
         .collect()
+}
+
+/// The notification for `key` went up as `id`.
+fn posted(widget: &mut Claude, key: Key, id: u32) {
+    let _ = widget.update(Message::Posted(key, Some(id)));
+}
+
+fn signal(widget: &mut Claude, signal: notify::Signal) -> Effect<Message> {
+    widget.update(Message::Signal(signal))
 }
 
 #[test]
@@ -88,14 +92,22 @@ fn a_permission_prompt_is_a_notice_that_answers() {
     let shown = notices(&widget);
     assert_eq!(shown.len(), 1);
     assert_eq!(shown[0].summary, "Allow Bash?");
-    assert_eq!(shown[0].body.as_deref(), Some("$ rm -rf target"));
-    assert_eq!(shown[0].app.as_deref(), Some("Bar plugin"));
-    assert_eq!(labels(&shown[0]), ["Allow", "Deny", "Instead…"]);
+    assert_eq!(shown[0].body, "`$ rm -rf target`");
+    assert_eq!(shown[0].app, "Bar plugin");
+    assert_eq!(labels(&shown[0]), ["Allow", "Deny", "Open"]);
+    assert_eq!(
+        shown[0].reply.as_deref(),
+        Some("Or tell Claude what to do instead")
+    );
+    assert_eq!(shown[0].seconds, None, "it waits");
     assert_eq!(widget.waiting(), 1);
 
-    let _ = widget.update(Message::Allow(10_001));
+    // Its Allow, picked on the notification.
+    posted(&mut widget, Key::Prompt(10_001), 7);
+    let _ = signal(&mut widget, notify::Signal::Action(7, "allow".into()));
     assert_eq!(decision(&mut answer), json!({"behavior": "allow"}));
-    assert!(widget.notices().is_empty());
+    assert!(widget.wanted().is_empty());
+    assert!(widget.posted.is_empty(), "the server took it away itself");
 }
 
 #[test]
@@ -109,8 +121,8 @@ fn denying_stops_claude_and_instead_tells_it_why() {
         json!({"file_path": "/home/f/code/eave/a.rs"}),
     );
     assert_eq!(
-        notices(&widget)[0].body.as_deref(),
-        Some("a.rs"),
+        notices(&widget)[0].body,
+        "`a.rs`",
         "relative to the session"
     );
     let _ = widget.update(Message::Deny(10_002));
@@ -120,17 +132,13 @@ fn denying_stops_claude_and_instead_tells_it_why() {
         (&json!("deny"), &json!(true))
     );
 
+    // Typed into the notification.
     let mut answer = ask(&mut widget, 10_003, "s", "Write", json!({}));
-    let _ = widget.update(Message::StartReply(Target::Prompt(10_003)));
-    assert!(
-        notices(&widget)[0].reply.is_some(),
-        "the field shows once asked"
+    posted(&mut widget, Key::Prompt(10_003), 8);
+    let _ = signal(
+        &mut widget,
+        notify::Signal::Replied(8, "  use b.rs  ".into()),
     );
-    let _ = widget.update(Message::Draft(
-        Target::Prompt(10_003),
-        "  use b.rs  ".into(),
-    ));
-    let _ = widget.update(Message::SendReply);
     assert_eq!(
         decision(&mut answer),
         json!({"behavior": "deny", "message": "use b.rs"})
@@ -156,8 +164,10 @@ fn a_short_question_answers_from_the_notice() {
     let mut answer = ask(&mut widget, 10_005, "s", "AskUserQuestion", input.clone());
     let shown = notices(&widget);
     assert_eq!(shown[0].summary, "Fruit");
-    assert_eq!(labels(&shown[0]), ["Apple", "Pear", "Other…"]);
-    let _ = widget.update(Message::Pick(10_005, 0, 1));
+    assert_eq!(labels(&shown[0]), ["Apple", "Pear", "Open"]);
+    assert_eq!(shown[0].reply.as_deref(), Some("Your answer"));
+    posted(&mut widget, Key::Prompt(10_005), 9);
+    let _ = signal(&mut widget, notify::Signal::Action(9, "pick:1".into()));
     let picked = decision(&mut answer);
     assert_eq!(picked["behavior"], "allow");
     assert_eq!(
@@ -195,7 +205,12 @@ fn several_questions_wait_for_send() {
     let mut answer = ask(&mut widget, 10_007, "s", "AskUserQuestion", input);
     let shown = notices(&widget);
     assert_eq!(shown[0].summary, "2 questions");
-    assert_eq!(labels(&shown[0]), ["Answer…"], "the popover asks them");
+    assert_eq!(
+        labels(&shown[0]),
+        ["Answer…", "Open"],
+        "the popover asks them"
+    );
+    assert_eq!(shown[0].reply, None);
 
     let _ = widget.update(Message::Pick(10_007, 0, 0));
     let _ = widget.update(Message::Pick(10_007, 0, 2));
@@ -223,10 +238,11 @@ fn a_plan_is_approved_or_sent_back() {
     );
     let shown = notices(&widget);
     assert_eq!(
-        (shown[0].summary.as_str(), shown[0].body.as_deref()),
-        ("Plan ready", Some("# Plan\n1. do it"))
+        (shown[0].summary.as_str(), shown[0].body.as_str()),
+        ("Plan ready", "# Plan\n1. do it")
     );
-    assert_eq!(labels(&shown[0]), ["Approve", "Change…"]);
+    assert_eq!(labels(&shown[0]), ["Approve", "Open"]);
+    assert_eq!(shown[0].reply.as_deref(), Some("What should change?"));
     let _ = widget.update(Message::Draft(
         Target::Prompt(10_008),
         "smaller steps".into(),
@@ -236,6 +252,97 @@ fn a_plan_is_approved_or_sent_back() {
         decision(&mut answer),
         json!({"behavior": "deny", "message": "smaller steps"})
     );
+}
+
+#[test]
+fn approving_a_plan_gives_its_input_back_and_leaves_plan_mode() {
+    let mut widget = claude();
+    // The session worked in auto mode before planning.
+    let submit = hook("s", "UserPromptSubmit", json!({"permission_mode": "auto"}));
+    let _ = widget.update(Message::Hooks(hooks::Event::Hook(Box::new(submit))));
+    let input = json!({"plan": "# Plan", "planFilePath": "/p.md"});
+    let mut answer = ask(&mut widget, 10_016, "s", "ExitPlanMode", input.clone());
+    posted(&mut widget, Key::Prompt(10_016), 11);
+    let _ = signal(&mut widget, notify::Signal::Action(11, "approve".into()));
+    assert_eq!(
+        decision(&mut answer),
+        json!({
+            "behavior": "allow",
+            "updatedInput": input,
+            "updatedPermissions": [{"type": "setMode", "mode": "auto", "destination": "session"}],
+        })
+    );
+
+    // Without a mode seen, what Claude Code suggests, else the default.
+    let mut widget = claude();
+    let answer = hooks::expect(10_017);
+    let plan = hook(
+        "t",
+        "PermissionRequest",
+        json!({"tool_name": "ExitPlanMode", "tool_input": {"plan": "p"}, "permission_mode": "plan",
+            "permission_suggestions": [{"type": "setMode", "mode": "acceptEdits", "destination": "session"}]}),
+    );
+    let _ = widget.update(Message::Hooks(hooks::Event::Asked(10_017, Box::new(plan))));
+    let _ = widget.update(Message::Approve(10_017));
+    let mut answer = answer;
+    assert_eq!(
+        decision(&mut answer)["updatedPermissions"][0]["mode"],
+        "acceptEdits"
+    );
+    let mut widget = claude();
+    let mut answer = ask(
+        &mut widget,
+        10_018,
+        "u",
+        "ExitPlanMode",
+        json!({"plan": "p"}),
+    );
+    let _ = widget.update(Message::Approve(10_018));
+    assert_eq!(
+        decision(&mut answer)["updatedPermissions"][0]["mode"],
+        "default"
+    );
+}
+
+#[test]
+fn notifications_go_up_once_and_close_when_answered_elsewhere() {
+    let mut widget = claude();
+    let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
+    let _answer = ask(&mut widget, 10_019, "s", "Bash", json!({}));
+    assert_eq!(widget.posted.len(), 1, "sent");
+    let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
+    assert_eq!(widget.posted.len(), 1, "not again");
+    // Answered in the terminal before its id came: closed as soon as it does.
+    let _ = widget.update(Message::Hooks(hooks::Event::Settled(10_019)));
+    assert!(widget.posted[0].gone);
+    let closes = widget.update(Message::Posted(Key::Prompt(10_019), Some(3)));
+    assert!(widget.posted.is_empty());
+    let _ = closes;
+
+    // Dismissed: the prompt still waits in the popover, without a notification.
+    let _answer = ask(&mut widget, 10_020, "s", "Bash", json!({}));
+    posted(&mut widget, Key::Prompt(10_020), 4);
+    let _ = signal(&mut widget, notify::Signal::Closed(4, 2));
+    assert!(widget.wanted().is_empty());
+    assert_eq!(widget.prompts.len(), 1);
+    assert!(widget.posted.is_empty());
+
+    // Someone else's notification is none of ours.
+    let _ = signal(&mut widget, notify::Signal::Action(99, "allow".into()));
+    assert_eq!(widget.prompts.len(), 1);
+}
+
+#[test]
+fn a_click_on_a_notification_opens_its_chat() {
+    let mut widget = claude();
+    let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
+    let _answer = ask(&mut widget, 10_021, "s", "Bash", json!({}));
+    posted(&mut widget, Key::Prompt(10_021), 5);
+    let effect = signal(&mut widget, notify::Signal::Action(5, "default".into()));
+    assert!(effect.into_parts().1.is_some(), "opens the popover");
+    assert_eq!(widget.page, Page::Chat("s".into()));
+    assert_eq!(widget.prompts.len(), 1, "still to answer, in the chat");
+    assert!(widget.prompts[0].hidden);
 }
 
 #[test]
@@ -290,24 +397,26 @@ fn a_finished_turn_says_so_and_takes_a_reply() {
     let _ = widget.update(Message::Hooks(hooks::Event::Hook(Box::new(stop))));
     let shown = notices(&widget);
     assert_eq!(shown[0].summary, "Done");
-    assert_eq!(shown[0].body.as_deref(), Some("All tests pass."));
-    assert_eq!(labels(&shown[0]), ["Reply"]);
-    assert!(shown[0].expires.is_some());
+    assert_eq!(shown[0].body, "All tests pass.");
+    assert_eq!(labels(&shown[0]), ["Open"]);
+    assert_eq!(shown[0].reply.as_deref(), Some("Message Claude"));
+    assert_eq!(shown[0].seconds, Some(8));
     assert_eq!(
         widget.sessions[0].last_reply.as_deref(),
         Some("All tests pass.")
     );
-
-    let _ = widget.update(Message::StartReply(Target::Session("s".into())));
-    let shown = notices(&widget);
-    assert!(shown[0].reply.is_some());
-    assert!(shown[0].expires.is_none(), "it waits while you type");
+    // Clicked: its chat.
+    let key = widget.wanted()[0].0;
+    posted(&mut widget, key, 6);
+    let _ = signal(&mut widget, notify::Signal::Action(6, "default".into()));
+    assert_eq!(widget.page, Page::Chat("s".into()));
+    assert!(widget.wanted().is_empty());
 
     // A subagent finishing isn't the session finishing.
     let mut widget = claude();
     let sub = hook("s", "Stop", json!({"agent_id": "a1"}));
     let _ = widget.update(Message::Hooks(hooks::Event::Hook(Box::new(sub))));
-    assert!(widget.notices().is_empty());
+    assert!(widget.wanted().is_empty());
 }
 
 #[test]
@@ -319,7 +428,7 @@ fn done_can_be_turned_off() {
     .0;
     let stop = hook("s", "Stop", json!({"last_assistant_message": "ok"}));
     let _ = widget.update(Message::Hooks(hooks::Event::Hook(Box::new(stop))));
-    assert!(widget.notices().is_empty());
+    assert!(widget.wanted().is_empty());
 }
 
 #[test]
@@ -329,14 +438,15 @@ fn waiting_without_a_hook_says_so_in_a_moment() {
         "s",
         Status::Waiting("input needed".into()),
     )]));
-    assert!(widget.notices().is_empty(), "not yet: a hook may still ask");
+    assert!(widget.wanted().is_empty(), "not yet: a hook may still ask");
     let _ = widget.update(Message::Unasked("s".into()));
     let shown = notices(&widget);
     assert_eq!(shown[0].summary, "Waiting for you in the terminal");
-    assert_eq!(shown[0].body.as_deref(), Some("input needed"));
+    assert_eq!(shown[0].body, "input needed");
+    assert_eq!(labels(&shown[0]), ["Show", "Open"]);
 
     let _ = widget.update(Message::Sessions(vec![live("s", Status::Idle)]));
-    assert!(widget.notices().is_empty(), "answered in the terminal");
+    assert!(widget.wanted().is_empty(), "answered in the terminal");
 
     // When a hook did ask, its prompt says it.
     let _ = widget.update(Message::Sessions(vec![live(
@@ -356,7 +466,7 @@ fn a_session_that_ends_takes_its_prompts_with_it() {
         Status::Waiting(String::new()),
     )]));
     let _answer = ask(&mut widget, 10_013, "s", "Bash", json!({}));
-    let _ = widget.update(Message::Show(Page::Session("s".into())));
+    let _ = widget.update(Message::Show(Page::Chat("s".into())));
     let _ = widget.update(Message::Sessions(Vec::new()));
     assert!(widget.prompts.is_empty());
     assert_eq!(widget.page, Page::Sessions);
@@ -367,13 +477,32 @@ fn a_session_that_ends_takes_its_prompts_with_it() {
 }
 
 #[test]
-fn hiding_a_prompt_keeps_it_in_the_popover() {
+fn a_chat_follows_only_the_session_showing() {
     let mut widget = claude();
+    let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
+    let _ = widget.update(Message::Show(Page::Chat("s".into())));
+    let _ = widget.update(Message::Opened);
+    let mut chat = Chat::default();
+    chat.read_line(r#"{"type":"user","message":{"content":"hi"}}"#, "/");
+    let _ = widget.update(Message::Chat("other".into(), chat.clone()));
+    assert!(widget.chat.is_none(), "not the one showing");
+    let _ = widget.update(Message::Chat("s".into(), chat));
+    assert!(widget.chat.is_some());
+    // The composer messages the session, or answers what it asks.
+    let _ = widget.update(Message::Draft(Target::Session("s".into()), "go".into()));
     let _answer = ask(&mut widget, 10_014, "s", "Bash", json!({}));
-    let _ = widget.update(Message::Hide(10_014));
-    assert!(widget.notices().is_empty());
-    assert_eq!(widget.prompts.len(), 1);
-    assert_eq!(widget.waiting(), 1);
+    assert_eq!(widget.pending("s").map(|p| p.id), Some(10_014));
+    let _ = widget.update(Message::Back);
+    assert!(widget.chat.is_none());
+    assert_eq!(widget.page, Page::Sessions);
+}
+
+#[test]
+fn code_is_inline_or_a_block() {
+    assert_eq!(code("$ ls"), "`$ ls`");
+    assert_eq!(code("a\nb"), "```\na\nb\n```");
+    assert_eq!(code("echo `x`"), "```\necho `x`\n```");
+    assert_eq!(code(""), "");
 }
 
 #[test]
@@ -411,12 +540,12 @@ fn pages_change_within_the_open_popover() {
     let asks_to_open =
         |widget: &mut Claude, page| widget.update(Message::Show(page)).into_parts().1.is_some();
     // From a notice: the popover opens on the page.
-    assert!(asks_to_open(&mut widget, Page::Session("s".into())));
+    assert!(asks_to_open(&mut widget, Page::Chat("s".into())));
     let _ = widget.update(Message::Opened);
     let _ = widget.update(Message::Back);
     // Within it: opening it again would close it first, and lose the page.
-    assert!(!asks_to_open(&mut widget, Page::Session("s".into())));
-    assert_eq!(widget.page, Page::Session("s".into()));
+    assert!(!asks_to_open(&mut widget, Page::Chat("s".into())));
+    assert_eq!(widget.page, Page::Chat("s".into()));
     let _ = widget.update(Message::Closed);
     assert_eq!(widget.page, Page::Sessions);
     assert!(asks_to_open(&mut widget, Page::Sessions));
