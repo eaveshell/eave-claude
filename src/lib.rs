@@ -1362,7 +1362,19 @@ impl Claude {
 
     /// A session's conversation, what it's doing now, what it asks, and a field to answer.
     fn chat_page(&self, session: &Session) -> ui::Node<Message> {
+        // The session's mascot in its mood, as in the list: it plays when the chat opens or the
+        // mood changes, and keeps going only while the session asks you something.
+        let mood = self.mood_of(session);
+        let sprite = mood.sprite();
+        let mascot = ui::sprite(sprite.frames, sprite.order);
+        let mascot = if mood == Mood::Question {
+            mascot.looping()
+        } else {
+            mascot
+        };
         let header = ui::header(session.label())
+            .leading(mascot)
+            .subtitle(home(&session.cwd))
             .on_back(Message::Back)
             .trailing(ui::button(
                 ui::label("Show"),
