@@ -371,8 +371,8 @@ fn a_click_on_a_notification_opens_its_chat() {
     let _answer = ask(&mut widget, 10_021, "s", "Bash", json!({}));
     posted(&mut widget, Key::Prompt(10_021), 5);
     let effect = signal(&mut widget, notify::Signal::Action(5, "default".into()));
-    assert!(effect.into_parts().1.is_some(), "opens the popover");
-    assert_eq!(widget.page, Page::Chat("s".into()));
+    assert!(effect.dialog_request().is_some(), "opens the dialog");
+    assert_eq!(widget.talking.as_deref(), Some("s"));
     assert_eq!(widget.prompts.len(), 1, "still to answer, in the chat");
     assert!(widget.prompts[0].hidden);
 }
@@ -444,7 +444,7 @@ fn a_finished_turn_says_so_and_takes_a_reply() {
     let key = widget.wanted()[0].0;
     posted(&mut widget, key, 6);
     let _ = signal(&mut widget, notify::Signal::Action(6, "default".into()));
-    assert_eq!(widget.page, Page::Chat("s".into()));
+    assert_eq!(widget.talking.as_deref(), Some("s"));
     assert!(widget.wanted().is_empty());
 
     // A subagent finishing isn't the session finishing.
@@ -504,7 +504,7 @@ fn a_session_that_ends_takes_its_prompts_with_it() {
     let _ = widget.update(Message::Show(Page::Chat("s".into())));
     let _ = widget.update(Message::Sessions(Vec::new()));
     assert!(widget.prompts.is_empty());
-    assert_eq!(widget.page, Page::Sessions);
+    assert!(widget.talking.is_none() && widget.dialog().is_none());
     assert!(
         widget.item().into_parts().content.is_none(),
         "hidden with nothing running"
@@ -529,7 +529,7 @@ fn a_chat_that_shows_needs_no_notifications() {
     let _ = widget.update(stop("s"));
     assert_eq!(widget.wanted().len(), 1);
     let _ = widget.update(Message::Show(Page::Chat("s".into())));
-    let _ = widget.update(Message::Opened);
+    let _ = widget.update(Message::DialogOpened);
     assert!(widget.wanted().is_empty());
     // Asked or said while it shows: none, and none once it closes.
     let _answer = ask(&mut widget, 10_015, "s", "Bash", json!({}));
@@ -541,7 +541,7 @@ fn a_chat_that_shows_needs_no_notifications() {
     // Another session still gets its own.
     let _ = widget.update(stop("t"));
     assert_eq!(widget.wanted().len(), 1);
-    let _ = widget.update(Message::Closed);
+    let _ = widget.update(Message::DialogClosed);
     assert_eq!(widget.wanted().len(), 1, "only the other session's");
 }
 
@@ -550,7 +550,7 @@ fn a_chat_follows_only_the_session_showing() {
     let mut widget = claude();
     let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
     let _ = widget.update(Message::Show(Page::Chat("s".into())));
-    let _ = widget.update(Message::Opened);
+    let _ = widget.update(Message::DialogOpened);
     let mut chat = Chat::default();
     chat.read_line(r#"{"type":"user","message":{"content":"hi"}}"#, "/");
     let _ = widget.update(Message::Chat("other".into(), chat.clone()));
@@ -561,9 +561,14 @@ fn a_chat_follows_only_the_session_showing() {
     let _ = widget.update(Message::Draft(Target::Session("s".into()), "go".into()));
     let _answer = ask(&mut widget, 10_014, "s", "Bash", json!({}));
     assert_eq!(widget.pending("s").map(|p| p.id), Some(10_014));
-    let _ = widget.update(Message::Back);
-    assert!(widget.chat.is_none());
-    assert_eq!(widget.page, Page::Sessions);
+    // The popover it came out of folds away: what's typed in the chat stays.
+    let _ = widget.update(Message::Closed);
+    assert!(widget.draft.is_some());
+    // Closed, it shows the chat while it goes back, but no longer follows it.
+    let _ = widget.update(Message::DialogClosed);
+    assert!(widget.draft.is_none());
+    assert!(widget.chat.is_some() && widget.dialog().is_some());
+    assert!(!widget.dialog_open);
 }
 
 #[test]
@@ -682,21 +687,29 @@ fn config_has_defaults() {
 }
 
 #[test]
-fn pages_change_within_the_open_popover() {
+fn a_chat_opens_in_the_dialog_and_pages_change_within_the_open_popover() {
     let mut widget = claude();
     let _ = widget.update(Message::Sessions(vec![live("s", Status::Idle)]));
-    let asks_to_open =
-        |widget: &mut Claude, page| widget.update(Message::Show(page)).into_parts().1.is_some();
-    // From a notice: the popover opens on the page.
-    assert!(asks_to_open(&mut widget, Page::Chat("s".into())));
+    let asks = |widget: &mut Claude, page| {
+        let effect = widget.update(Message::Show(page));
+        (
+            effect.dialog_request().is_some(),
+            effect.into_parts().1.is_some(),
+        )
+    };
+    // A chat: in the dialog, which the host opens once.
+    assert_eq!(asks(&mut widget, Page::Chat("s".into())), (true, false));
+    assert_eq!(widget.page, Page::Sessions);
+    // The list: in the popover.
+    assert_eq!(asks(&mut widget, Page::Sessions), (false, true));
     let _ = widget.update(Message::Opened);
-    let _ = widget.update(Message::Back);
     // Within it: opening it again would close it first, and lose the page.
-    assert!(!asks_to_open(&mut widget, Page::Chat("s".into())));
-    assert_eq!(widget.page, Page::Chat("s".into()));
+    assert_eq!(asks(&mut widget, Page::Sessions), (false, false));
     let _ = widget.update(Message::Closed);
     assert_eq!(widget.page, Page::Sessions);
-    assert!(asks_to_open(&mut widget, Page::Sessions));
+    // Showing the terminal closes the dialog too.
+    let effect = widget.update(Message::Focus("s".into()));
+    assert!(effect.dialog_request().is_some());
 }
 
 #[test]
