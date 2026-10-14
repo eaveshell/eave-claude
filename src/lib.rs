@@ -1556,24 +1556,31 @@ impl Claude {
         if self.sessions.is_empty() {
             rows.push(ui::label("No sessions running").tone(Tone::Dim));
         } else {
-            rows.push(ui::list(self.sessions.iter().map(|session| {
-                let asked = self.prompts.iter().any(|p| p.session == session.id);
-                // While the popover is open, every session's mascot acts out its mood.
-                let sprite = self.mood_of(session).sprite();
-                let row = ui::list_item(session.label())
-                    .leading(ui::sprite(sprite.frames, sprite.order).looping())
-                    .subtitle(format!(
-                        "{} · {}",
-                        directory(&session.cwd),
-                        session.status_text()
-                    ))
-                    .on_press(Message::Show(Page::Chat(session.id.clone())));
-                if asked || matches!(session.status, Status::Waiting(_)) {
-                    row.trailing(ui::badge("needs you").tone(Tone::Warning))
-                } else {
-                    row
-                }
-            })));
+            rows.push(ui::list(self.sessions.iter().enumerate().map(
+                |(i, session)| {
+                    let asked = self.prompts.iter().any(|p| p.session == session.id);
+                    // While the popover is open, every session's mascot acts out its mood.
+                    let sprite = self.mood_of(session).sprite();
+                    let row = ui::list_item(session.label())
+                        .leading(ui::sprite(sprite.frames, sprite.order).looping())
+                        .subtitle(format!(
+                            "{} · {}",
+                            directory(&session.cwd),
+                            session.status_text()
+                        ))
+                        .on_press(Message::Show(Page::Chat(session.id.clone())));
+                    // The first ten open with 1 to 9, then 0, like the keys along the top row.
+                    let row = match char::from_digit((i as u32 + 1) % 10, 10) {
+                        Some(key) if i < 10 => row.shortcut(ui::shortcut(key)),
+                        _ => row,
+                    };
+                    if asked || matches!(session.status, Status::Waiting(_)) {
+                        row.trailing(ui::badge("needs you").tone(Tone::Warning))
+                    } else {
+                        row
+                    }
+                },
+            )));
         }
         let strays: Vec<_> = self
             .prompts
