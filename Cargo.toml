@@ -18,7 +18,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # already in the build through eave's other plugins.
 eave-dbus = "0.1.1"
 # Focuses the terminal a session runs in.
-eave-hyprland = "0.1"
+eave-hyprland = "0.2"
 # The hook server's event stream. Already in the build through iced.
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 # Watches ~/.claude/sessions and the transcript of the chat showing with inotify, and wakes now

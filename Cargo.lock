@@ -144,9 +144,9 @@ dependencies = [
 
 [[package]]
 name = "eave-hyprland"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44d08832abbaa732ef5fc0326ab0ace107ecc3f29889c0f8ce83e4ccd085e564"
+checksum = "7eafc45afbd4802908bcf6e1bdc8abc46b5499efddc988a576cc1b6fe93be81d"
 dependencies = [
  "futures-util",
  "serde",
