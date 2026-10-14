@@ -340,14 +340,14 @@ fn an_approved_plan_goes_on_in_the_configured_mode() {
 fn notifications_go_up_once_and_close_when_answered_elsewhere() {
     let mut widget = claude();
     let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
-    let _answer = ask(&mut widget, 10_019, "s", "Bash", json!({}));
+    let _answer = ask(&mut widget, 10_022, "s", "Bash", json!({}));
     assert_eq!(widget.posted.len(), 1, "sent");
     let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
     assert_eq!(widget.posted.len(), 1, "not again");
     // Answered in the terminal before its id came: closed as soon as it does.
-    let _ = widget.update(Message::Hooks(hooks::Event::Settled(10_019)));
+    let _ = widget.update(Message::Hooks(hooks::Event::Settled(10_022)));
     assert!(widget.posted[0].gone);
-    let closes = widget.update(Message::Posted(Key::Prompt(10_019), Some(3)));
+    let closes = widget.update(Message::Posted(Key::Prompt(10_022), Some(3)));
     assert!(widget.posted.is_empty());
     let _ = closes;
 
@@ -720,29 +720,29 @@ fn questions_come_one_at_a_time() {
         {"question": "Two?", "options": [{"label": "C"}, {"label": "D"}]},
         {"question": "Three?", "options": [{"label": "E"}, {"label": "F"}]},
     ]});
-    let mut answer = ask(&mut widget, 10_015, "s", "AskUserQuestion", input);
+    let mut answer = ask(&mut widget, 10_023, "s", "AskUserQuestion", input);
     let at = |widget: &Claude| match &widget.prompts[0].ask {
         Ask::Question { at, .. } => *at,
         _ => unreachable!(),
     };
     assert_eq!(at(&widget), 0);
     // Picking moves on to the next one.
-    let _ = widget.update(Message::Pick(10_015, 0, 1));
+    let _ = widget.update(Message::Pick(10_023, 0, 1));
     assert_eq!(at(&widget), 1);
     // Typing answers the one showing, and moves on too.
-    let _ = widget.update(Message::Draft(Target::Prompt(10_015), "my own".into()));
+    let _ = widget.update(Message::Draft(Target::Prompt(10_023), "my own".into()));
     let _ = widget.update(Message::SendReply);
     assert_eq!(at(&widget), 2);
     // The arrows go back, and a change there doesn't send while one is left.
-    let _ = widget.update(Message::Turn(10_015, 0));
-    let _ = widget.update(Message::Pick(10_015, 0, 0));
+    let _ = widget.update(Message::Turn(10_023, 0));
+    let _ = widget.update(Message::Pick(10_023, 0, 0));
     assert_eq!(at(&widget), 1);
     assert!(answer.try_recv().is_err());
-    let _ = widget.update(Message::Turn(10_015, 9));
+    let _ = widget.update(Message::Turn(10_023, 9));
     assert_eq!(at(&widget), 1, "no such question");
     // The last one answered sends them all.
-    let _ = widget.update(Message::Turn(10_015, 2));
-    let _ = widget.update(Message::Pick(10_015, 2, 1));
+    let _ = widget.update(Message::Turn(10_023, 2));
+    let _ = widget.update(Message::Pick(10_023, 2, 1));
     assert_eq!(
         decision(&mut answer)["updatedInput"]["answers"],
         json!({"One?": "A", "Two?": "my own", "Three?": "F"})
