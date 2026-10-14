@@ -8,7 +8,7 @@
 //! so it's the sprite's resting frame, made square. The bodies are Claude's Markdown, which eave sets as such (`x-eave-markdown`); other
 //! daemons show it as it is.
 //!
-//! eave's server says more (eave's D-83), when it lists the capabilities: the app is Claude and
+//! eave's server says more (eave's D-85), when it lists the capabilities: the app is Claude and
 //! the session its thread, with the mascot as the app's icon (`x-eave-thread`, `x-eave-icon`),
 //! and a question comes with its options, descriptions and all, one at a time
 //! (`x-eave-choices`). Other servers get the session as the app, the mascot as the picture, and
