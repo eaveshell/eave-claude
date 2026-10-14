@@ -1571,7 +1571,9 @@ impl Claude {
                         .on_press(Message::Show(Page::Chat(session.id.clone())));
                     // The first ten open with 1 to 9, then 0, like the keys along the top row.
                     let row = match char::from_digit((i as u32 + 1) % 10, 10) {
-                        Some(key) if i < 10 => row.shortcut(ui::shortcut(key)),
+                        Some(key) if i < 10 => {
+                            row.shortcut(format!("chat-{}", i + 1), ui::shortcut(key))
+                        }
                         _ => row,
                     };
                     if asked || matches!(session.status, Status::Waiting(_)) {
