@@ -359,6 +359,69 @@ impl Widget for Claude {
         let panel = panel.unwrap_or_else(|| Panel::new(self.sessions_page()));
         Some(panel.on_open(Message::Opened).on_close(Message::Closed))
     }
+
+    /// What the sessions ask, answered from the dormer: a permission allowed or denied, a plan
+    /// approved, a question opened to answer. Then each session's chat, and its terminal.
+    fn actions(&self) -> Vec<ui::Action<Message>> {
+        let words = ["claude", "session"];
+        let mascot = |mood: Mood| ui::image(mood.sprite().note);
+        let mut actions = Vec::new();
+        for prompt in &self.prompts {
+            let label = self.label(&prompt.session, &prompt.cwd);
+            let asking = |title: String, message| {
+                ui::action(title, message)
+                    .subtitle(label.clone())
+                    .keywords(words)
+                    .leading(mascot(Mood::Question))
+            };
+            match &prompt.ask {
+                Ask::Permission { tool, .. } => actions.extend([
+                    asking(format!("Allow {tool}"), Message::Allow(prompt.id))
+                        .keywords(["permission", "yes"]),
+                    asking(format!("Deny {tool}"), Message::Deny(prompt.id))
+                        .keywords(["permission", "no"]),
+                ]),
+                Ask::Plan { .. } => actions.push(
+                    asking("Approve plan".into(), Message::Approve(prompt.id))
+                        .keywords(["plan", "yes"]),
+                ),
+                Ask::Question { questions, at, .. } => {
+                    let question = questions.get(*at).or(questions.first());
+                    let title = question.map_or_else(|| "Claude asks".into(), question_title);
+                    actions.push(
+                        asking(
+                            format!("Answer: {title}"),
+                            Message::Show(Page::Prompt(prompt.id)),
+                        )
+                        .keywords(["question"]),
+                    );
+                }
+            }
+        }
+        for session in &self.sessions {
+            let label = session.label();
+            let mood = self.mood_of(session);
+            actions.push(
+                ui::action(
+                    format!("Open {label}"),
+                    Message::Show(Page::Chat(session.id.clone())),
+                )
+                .subtitle(format!("Claude Code · {}", session.status_text()))
+                .keywords(words.into_iter().chain(["chat"]))
+                .leading(mascot(mood)),
+            );
+            actions.push(
+                ui::action(
+                    format!("Show the terminal of {label}"),
+                    Message::Focus(session.id.clone()),
+                )
+                .subtitle(directory(&session.cwd))
+                .keywords(words.into_iter().chain(["terminal", "focus"]))
+                .leading(mascot(mood)),
+            );
+        }
+        actions
+    }
 }
 
 impl Claude {
