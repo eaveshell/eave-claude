@@ -53,6 +53,8 @@ when one waits for you in the terminal, but can't answer for it.
   colored, the tools it runs with what came of them, the edits it makes as diffs, what it asks
   you, and a field to message it. Show focuses its terminal. Clicking a notification opens
   its session's chat.
+- **In the dormer:** allow or deny what a session asks, approve a plan, open a question to
+  answer it, and open any session's chat or show its terminal.
 
 While a session's chat is open in the popover, it sends no notifications for that session: you're
 reading it already, and what it asks is answered right there.

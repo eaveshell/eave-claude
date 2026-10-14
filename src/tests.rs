@@ -886,3 +886,39 @@ fn several_picks_from_the_card_answer_a_question() {
         json!({"Which hints?": "transient, image-data"})
     );
 }
+
+#[test]
+fn the_dormer_answers_prompts_and_opens_sessions() {
+    let mut widget = claude();
+    let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
+    let titles = |widget: &Claude| -> Vec<String> {
+        widget
+            .actions()
+            .iter()
+            .map(|action| action.title().to_string())
+            .collect()
+    };
+    assert_eq!(
+        titles(&widget),
+        ["Open Bar plugin", "Show the terminal of Bar plugin"]
+    );
+
+    let mut answer = ask(
+        &mut widget,
+        10_100,
+        "s",
+        "Bash",
+        json!({"command": "cargo test"}),
+    );
+    assert_eq!(titles(&widget)[..2], ["Allow Bash", "Deny Bash"]);
+    let allow = widget
+        .actions()
+        .into_iter()
+        .next()
+        .unwrap()
+        .into_parts()
+        .message;
+    let _ = widget.update(allow);
+    assert_eq!(decision(&mut answer), json!({"behavior": "allow"}));
+    assert_eq!(titles(&widget).len(), 2, "answered, so no longer asked");
+}
