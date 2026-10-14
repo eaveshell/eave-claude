@@ -94,6 +94,10 @@ pub struct Claude {
     open: bool,
     /// The conversation of the session whose chat shows.
     chat: Option<(String, Chat)>,
+    /// The session whose chat the dialog shows, or showed last: it keeps it while it goes back.
+    talking: Option<String>,
+    /// Whether the dialog is open.
+    dialog_open: bool,
 }
 
 struct Session {
@@ -235,7 +239,7 @@ pub enum Message {
     Turn(u64, usize),
     Draft(Target, String),
     SendReply,
-    /// Goes to a page, opening the popover if it's closed.
+    /// Goes to a page, opening the popover if it's closed. A chat opens in the dialog.
     Show(Page),
     Back,
     /// Focuses the terminal a session runs in.
@@ -244,6 +248,9 @@ pub enum Message {
     Unasked(String),
     Opened,
     Closed,
+    /// The chat's dialog opened, or started going back.
+    DialogOpened,
+    DialogClosed,
     /// Time changed a session's mood: done a while ago, or night fell.
     Tick,
 }
@@ -269,6 +276,8 @@ impl Widget for Claude {
             draft: None,
             open: false,
             chat: None,
+            talking: None,
+            dialog_open: false,
         };
         (claude, Task::none())
     }
@@ -288,7 +297,7 @@ impl Widget for Claude {
             Subscription::run(notify::signals).map(Message::Signal),
         ];
         // The conversation, only while it shows.
-        if let (true, Page::Chat(id)) = (self.open, &self.page)
+        if let (true, Some(id)) = (self.dialog_open, &self.talking)
             && let Some(session) = self.session(id)
             && let Some(config) = sessions::config_dir()
         {
@@ -348,16 +357,23 @@ impl Widget for Claude {
 
     fn popover(&self) -> Option<Panel<Message>> {
         let panel = match &self.page {
-            Page::Chat(id) => self
-                .session(id)
-                .map(|session| Panel::new(self.chat_page(session)).wide()),
             Page::Prompt(id) => self
                 .prompt(*id)
                 .map(|prompt| Panel::new(self.prompt_page(prompt)).wide()),
-            Page::Sessions => None,
+            Page::Chat(_) | Page::Sessions => None,
         };
         let panel = panel.unwrap_or_else(|| Panel::new(self.sessions_page()));
         Some(panel.on_open(Message::Opened).on_close(Message::Closed))
+    }
+
+    /// A session's chat, in the middle of the screen: it comes out of what opened it.
+    fn dialog(&self) -> Option<Panel<Message>> {
+        let session = self.session(self.talking.as_ref()?)?;
+        Some(
+            Panel::new(self.chat_page(session))
+                .on_open(Message::DialogOpened)
+                .on_close(Message::DialogClosed),
+        )
     }
 
     /// What the sessions ask, answered from the dormer: a permission allowed or denied, a plan
@@ -432,7 +448,7 @@ impl Claude {
             Message::Signal(signal) => self.signalled(signal),
             Message::Posted(key, id) => self.posted(key, id),
             Message::Chat(id, chat) => {
-                if self.page == Page::Chat(id.clone()) {
+                if self.talking.as_ref() == Some(&id) {
                     self.chat = Some((id, chat));
                 }
                 Effect::none()
@@ -488,17 +504,19 @@ impl Claude {
             }
             Message::Show(page) => self.show(page),
             Message::Back => {
-                self.page = match &self.page {
+                let session = match &self.page {
                     Page::Prompt(id) => self
                         .prompt(*id)
                         .map(|prompt| prompt.session.clone())
-                        .filter(|session| self.session(session).is_some())
-                        .map_or(Page::Sessions, Page::Chat),
-                    _ => Page::Sessions,
+                        .filter(|session| self.session(session).is_some()),
+                    _ => None,
                 };
+                self.page = Page::Sessions;
                 self.draft = None;
-                self.chat = None;
-                Effect::none()
+                match session {
+                    Some(session) => self.show(Page::Chat(session)),
+                    None => Effect::none(),
+                }
             }
             Message::Focus(id) => {
                 let Some(session) = self.session(&id) else {
@@ -518,6 +536,7 @@ impl Claude {
                     .discard(),
                 )
                 .close_popover()
+                .close_dialog()
             }
             Message::Unasked(id) => {
                 let waiting = match self.session(&id).map(|session| &session.status) {
@@ -543,15 +562,28 @@ impl Claude {
             Message::Closed => {
                 self.open = false;
                 self.page = Page::Sessions;
+                // What's typed in the chat stays with it.
+                if !self.dialog_open {
+                    self.draft = None;
+                }
+                Effect::none()
+            }
+            Message::DialogOpened => {
+                self.dialog_open = true;
+                Effect::none()
+            }
+            // It keeps showing the chat while it goes back.
+            Message::DialogClosed => {
+                self.dialog_open = false;
                 self.draft = None;
-                self.chat = None;
                 Effect::none()
             }
         }
     }
 
-    /// Goes to `page`, opening the popover if it's closed. A prompt of a session in the list
-    /// shows in that session's chat.
+    /// Goes to `page`, opening the popover if it's closed. A chat opens in the dialog, and the
+    /// popover it may come out of folds away. A prompt of a session in the list shows in that
+    /// session's chat.
     fn show(&mut self, page: Page) -> Effect<Message> {
         let page = match page {
             Page::Prompt(id) => match self.prompt(id) {
@@ -562,8 +594,15 @@ impl Claude {
             },
             page => page,
         };
+        if let Page::Chat(id) = page {
+            if self.talking.as_ref() != Some(&id) {
+                self.chat = None;
+                self.draft = None;
+            }
+            self.talking = Some(id);
+            return Effect::none().open_dialog();
+        }
         if self.page != page {
-            self.chat = None;
             self.draft = None;
         }
         self.page = page;
@@ -735,8 +774,8 @@ impl Claude {
                     .iter()
                     .any(|s| s.id == note.session && matches!(s.status, Status::Waiting(_)))
         });
-        if matches!(&self.page, Page::Chat(id) if self.session(id).is_none()) {
-            self.page = Page::Sessions;
+        if matches!(&self.talking, Some(id) if self.session(id).is_none()) {
+            self.talking = None;
             self.chat = None;
         }
         Effect::task(Task::batch(unasked.into_iter().map(|id| {
@@ -1249,7 +1288,7 @@ impl Claude {
     /// It stays hidden after the chat closes, so it doesn't pop up then. Any notification already
     /// up for it goes away.
     fn quiet_chat(&mut self) {
-        let (true, Page::Chat(id)) = (self.open, &self.page) else {
+        let (true, Some(id)) = (self.dialog_open, &self.talking) else {
             return;
         };
         for prompt in self.prompts.iter_mut().filter(|p| p.session == *id) {
@@ -1613,7 +1652,6 @@ impl Claude {
         let header = ui::header(session.label())
             .leading(mascot)
             .subtitle(home(&session.cwd))
-            .on_back(Message::Back)
             .trailing(ui::button(
                 ui::label("Show"),
                 Message::Focus(session.id.clone()),

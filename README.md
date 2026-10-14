@@ -47,16 +47,17 @@ when one waits for you in the terminal, but can't answer for it.
   to the mode set in `plan`.
 - **Done:** when a session finishes its turn, its last reply, its first line as the title, with a
   field to answer it. A turn that stops with an error is critical: it stays until you see it.
-- **The popover:** your sessions, each with its mascot, and what it's doing. A click opens its chat: the
+- **The popover:** your sessions, each with its mascot, and what it's doing. A click opens its chat,
+  in a dialog in the middle of the screen, which the popover turns into: the
   conversation as it happens, a turn at a time under the time you spoke, its steps strung on a
   line, each marked done, under way, failed or waiting for you. Markdown and all, with code
   colored, the tools it runs with what came of them, the edits it makes as diffs, what it asks
-  you, and a field to message it. Show focuses its terminal. Clicking a notification opens
-  its session's chat.
+  you, and a field to message it. Show focuses its terminal, and Esc closes it. Clicking a
+  notification opens its session's chat, which the notification turns into.
 - **In the dormer:** allow or deny what a session asks, approve a plan, open a question to
-  answer it, and open any session's chat or show its terminal.
+  answer it, and open any session's chat, which the dormer turns into, or show its terminal.
 
-While a session's chat is open in the popover, it sends no notifications for that session: you're
+While a session's chat is open, it sends no notifications for that session: you're
 reading it already, and what it asks is answered right there.
 
 Whatever you answer in the bar, the terminal shows the same prompt meanwhile, and whichever you
