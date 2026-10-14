@@ -48,7 +48,8 @@ when one waits for you in the terminal, but can't answer for it.
 - **Done:** when a session finishes its turn, its last reply, its first line as the title, with a
   field to answer it. A turn that stops with an error is critical: it stays until you see it.
 - **The popover:** your sessions, each with its mascot, and what it's doing. A click opens its chat,
-  in a dialog in the middle of the screen, which the popover turns into: the
+  and so do the keys 1 to 9 and 0 for the first ten (see [Keys](#keys)), in a dialog in the middle
+  of the screen, which the popover turns into: the
   conversation as it happens, a turn at a time under the time you spoke, its steps strung on a
   line, each marked done, under way, failed or waiting for you. Markdown and all, with code
   colored, the tools it runs with what came of them, the edits it makes as diffs, what it asks
@@ -71,6 +72,20 @@ swaync. They carry the mascot, in the mood that fits (asking, or happy when done
 as such. In eave they come from Claude, with the session beside it and the mascot as the icon, and
 a session's notifications stack on one card; other daemons show the session as the app. In eave, the field to answer is right on the notification; the bar takes the keyboard
 only once you click it.
+
+## Keys
+
+While the popover is open, `1` to `9` and `0` open the first ten sessions' chats. They're named
+`chat-1` to `chat-10`, so you can give them other keys, or none, in the widget's entry:
+
+```toml
+[[right]]
+widget = "fran/eave-claude"
+keys = { chat-1 = "alt+1", chat-10 = false }
+```
+
+To open the popover from anywhere, bind a key in Hyprland: `bind = SUPER, C, event, eave-popover
+claude`, or run `eave popover claude`.
 
 ## How it works
 
