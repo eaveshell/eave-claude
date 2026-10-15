@@ -4,15 +4,17 @@
 //! sessions; each one opens its conversation, live, with what it's doing now, what it asks, and a
 //! field to answer it.
 //!
-//! Four sources, each for what only it knows:
+//! Five sources, each for what only it knows:
 //! - `~/.claude/sessions/` ([`sessions`]): which sessions run and whether they wait for you.
 //! - The eave plugin for Claude Code ([`hooks`]): what they ask, and the answers.
 //! - Each session's transcript ([`transcript`]): the conversation, while it shows.
 //! - Each session's messaging socket ([`peer`]): what you type to them.
+//! - Hyprland, and kitty ([`kitty`]) when a session runs in it: whether its terminal is in front.
 //!
 //! Notifications go over the session bus like any app's ([`notify`]).
 
 mod hooks;
+mod kitty;
 mod mascot;
 mod mood;
 mod notify;
@@ -28,6 +30,7 @@ use std::path::PathBuf;
 use eave_api::time::{Duration, sleep};
 use eave_api::ui::{self, Item, Panel, Tone};
 use eave_api::{Effect, Nudge, Registry, Subscription, Task, Widget};
+use eave_hyprland::Event;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -49,6 +52,8 @@ pub struct Config {
     /// The mode an approved plan goes on in: `auto`, `acceptEdits`, `default`… Unset, the one
     /// the session was in before planning.
     plan: Option<String>,
+    /// No notifications for a session whose terminal is in front of you, on its tab.
+    watching: bool,
 }
 
 impl Default for Config {
@@ -57,6 +62,7 @@ impl Default for Config {
             done: true,
             timeout: 8,
             plan: None,
+            watching: true,
         }
     }
 }
@@ -98,6 +104,12 @@ pub struct Claude {
     talking: Option<String>,
     /// Whether the dialog is open.
     dialog_open: bool,
+    /// The session whose terminal is in front of you, on its tab.
+    front: Option<String>,
+    /// How many times the front was looked for: only the last answer counts.
+    looked: u64,
+    /// The focused window's class and title, as Hyprland last said.
+    focused: Option<(String, String)>,
 }
 
 struct Session {
@@ -108,6 +120,7 @@ struct Session {
     title: Option<String>,
     status: Status,
     socket: Option<PathBuf>,
+    kitty: Option<kitty::Pane>,
     /// The end of its last turn.
     last_reply: Option<String>,
     /// Milliseconds since the epoch.
@@ -253,6 +266,10 @@ pub enum Message {
     DialogClosed,
     /// Time changed a session's mood: done a while ago, or night fell.
     Tick,
+    /// Focus moved, or a window's title changed.
+    Hyprland(eave_hyprland::Update<()>),
+    /// The session in front, as found by look `n`.
+    Front(u64, Option<String>),
 }
 
 impl Widget for Claude {
@@ -278,6 +295,9 @@ impl Widget for Claude {
             chat: None,
             talking: None,
             dialog_open: false,
+            front: None,
+            looked: 0,
+            focused: None,
         };
         (claude, Task::none())
     }
@@ -285,7 +305,7 @@ impl Widget for Claude {
     fn update(&mut self, message: Message) -> Effect<Message> {
         self.clock = Clock::now();
         let effect = self.handle(message);
-        self.quiet_chat();
+        self.quiet();
         let post = self.post();
         effect.and_task(post)
     }
@@ -296,6 +316,11 @@ impl Widget for Claude {
             sessions::watch().map(Message::Sessions),
             Subscription::run(notify::signals).map(Message::Signal),
         ];
+        // What's in front, while there are sessions to be in front.
+        if self.config.watching && !self.sessions.is_empty() {
+            subscriptions
+                .push(Subscription::run(|| eave_hyprland::watch(awake)).map(Message::Hyprland));
+        }
         // The conversation, only while it shows.
         if let (true, Some(id)) = (self.dialog_open, &self.talking)
             && let Some(session) = self.session(id)
@@ -444,7 +469,32 @@ impl Claude {
     fn handle(&mut self, message: Message) -> Effect<Message> {
         match message {
             Message::Hooks(event) => self.heard(event),
-            Message::Sessions(live) => self.sessions_changed(live),
+            Message::Sessions(live) => {
+                let effect = self.sessions_changed(live);
+                effect.and_task(self.look())
+            }
+            Message::Hyprland(update) => {
+                if let eave_hyprland::Update::Event(Event::ActiveWindow { class, title }) = update {
+                    let focused = Some((class, title));
+                    if self.focused == focused {
+                        return Effect::none();
+                    }
+                    self.focused = focused;
+                } else if !matches!(
+                    update,
+                    eave_hyprland::Update::Snapshot(())
+                        | eave_hyprland::Update::Event(Event::FocusedWindow { .. })
+                ) {
+                    return Effect::none();
+                }
+                Effect::task(self.look())
+            }
+            Message::Front(n, front) => {
+                if n == self.looked {
+                    self.front = front;
+                }
+                Effect::none()
+            }
             Message::Signal(signal) => self.signalled(signal),
             Message::Posted(key, id) => self.posted(key, id),
             Message::Chat(id, chat) => {
@@ -736,6 +786,7 @@ impl Claude {
                 title: live.title,
                 status: live.status,
                 socket: live.socket,
+                kitty: live.kitty,
                 last_reply,
                 started: live.started,
                 since: live.since,
@@ -1283,20 +1334,41 @@ impl Claude {
         }
     }
 
-    /// Its notification is gone: a prompt still waits in the popover, a note is done with.
-    /// What the session whose chat shows asks or says needs no notification: you're reading it.
-    /// It stays hidden after the chat closes, so it doesn't pop up then. Any notification already
-    /// up for it goes away.
-    fn quiet_chat(&mut self) {
-        let (true, Some(id)) = (self.dialog_open, &self.talking) else {
-            return;
-        };
-        for prompt in self.prompts.iter_mut().filter(|p| p.session == *id) {
-            prompt.hidden = true;
+    /// What the session whose chat shows, or whose terminal is in front, asks or says needs no
+    /// notification: you're reading it. It stays hidden after you look away, so it doesn't pop
+    /// up then. Any notification already up for it goes away.
+    fn quiet(&mut self) {
+        let chat = self.talking.as_ref().filter(|_| self.dialog_open);
+        let front = self.front.as_ref().filter(|_| self.config.watching);
+        for id in [chat, front].into_iter().flatten() {
+            for prompt in self.prompts.iter_mut().filter(|p| p.session == *id) {
+                prompt.hidden = true;
+            }
+            for note in self.notes.iter_mut().filter(|n| n.session == *id) {
+                note.hidden = true;
+            }
         }
-        for note in self.notes.iter_mut().filter(|n| n.session == *id) {
-            note.hidden = true;
+    }
+
+    /// Looks for the session in front again.
+    fn look(&mut self) -> Task<Message> {
+        self.looked += 1;
+        if !self.config.watching || self.sessions.is_empty() {
+            self.front = None;
+            return Task::none();
         }
+        let n = self.looked;
+        let terminals: Vec<Terminal> = self
+            .sessions
+            .iter()
+            .map(|session| Terminal {
+                session: session.id.clone(),
+                pid: session.pid,
+                title: session.title.clone(),
+                kitty: session.kitty.clone(),
+            })
+            .collect();
+        Task::future(async move { Message::Front(n, front(terminals).await) })
     }
 
     fn hidden(&mut self, key: Key) {
@@ -2167,6 +2239,63 @@ async fn focus(pid: u32, title: Option<String>) -> io::Result<()> {
         &format!("focuswindow address:{address}"),
     )
     .await
+}
+
+/// A session, as [`front`] needs it.
+struct Terminal {
+    session: String,
+    pid: u32,
+    title: Option<String>,
+    kitty: Option<kitty::Pane>,
+}
+
+/// Hyprland's snapshot, when there's nothing to keep: each one says to look again.
+async fn awake() -> io::Result<()> {
+    Ok(())
+}
+
+/// The session whose terminal is in front of you: in the focused window, on its tab. kitty says
+/// exactly, when it takes remote control; else the window's title tells, as the terminal shows
+/// the session's.
+async fn front(terminals: Vec<Terminal>) -> Option<String> {
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct Window {
+        pid: i64,
+        title: String,
+    }
+    let window: Window = eave_hyprland::query("activewindow").await.ok()?;
+    let pid = u32::try_from(window.pid).ok()?;
+    let kitty = terminals.iter().find_map(|terminal| {
+        let pane = terminal.kitty.as_ref()?;
+        (pane.kitty == pid).then_some(pane.socket.clone()?)
+    });
+    if let Some(socket) = kitty
+        && let Ok(focused) = kitty::focused(&socket).await
+    {
+        let focused = focused?;
+        return terminals
+            .into_iter()
+            .find(|terminal| {
+                terminal
+                    .kitty
+                    .as_ref()
+                    .is_some_and(|pane| pane.kitty == pid && pane.window == focused)
+            })
+            .map(|terminal| terminal.session);
+    }
+    let mut titled = terminals.into_iter().filter(|terminal| {
+        terminal
+            .title
+            .as_ref()
+            .is_some_and(|title| window.title.contains(title.as_str()))
+            && sessions::ancestors(terminal.pid).contains(&pid)
+    });
+    // Two with the same title: it can't tell which, and doesn't guess.
+    match (titled.next(), titled.next()) {
+        (Some(terminal), None) => Some(terminal.session),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

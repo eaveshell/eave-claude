@@ -59,12 +59,22 @@ when one waits for you in the terminal, but can't answer for it.
   answer it, and open any session's chat, which the dormer turns into, or show its terminal.
 
 While a session's chat is open, it sends no notifications for that session: you're
-reading it already, and what it asks is answered right there.
+reading it already, and what it asks is answered right there. The same goes while its terminal is
+in front of you, on its tab: a notification already up goes away when you switch to it, and the
+prompt still waits in the popover. Most terminals are told apart by the window's title, which
+Claude Code sets to the session's. kitty can say exactly which tab and split you're on, with
+remote control on in `kitty.conf`:
+
+```
+allow_remote_control socket-only
+listen_on unix:@kitty-{kitty_pid}
+```
 
 Whatever you answer in the bar, the terminal shows the same prompt meanwhile, and whichever you
 answer first wins. Options: `done` (say so when a turn finishes, default `true`) and `timeout`
-(seconds that shows, default 8), and `plan` (the mode an approved plan goes on in, like `"auto"`;
-unset, the one before planning).
+(seconds that shows, default 8), `plan` (the mode an approved plan goes on in, like `"auto"`;
+unset, the one before planning), and `watching` (no notifications for a session whose terminal
+is in front, default `true`).
 
 Notifications go over the session bus like any app's, so they show in eave with
 [eave-notifications](https://github.com/eaveshell/eave-notifications), or in mako, dunst or

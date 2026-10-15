@@ -17,6 +17,7 @@ fn live(id: &str, status: Status) -> sessions::Live {
         title: Some("Bar plugin".into()),
         status,
         socket: Some(PathBuf::from("/run/user/1/cc-socks/4242.sock")),
+        kitty: None,
         started: 1,
         since: 1,
     }
@@ -546,6 +547,54 @@ fn a_chat_that_shows_needs_no_notifications() {
 }
 
 #[test]
+fn a_terminal_in_front_needs_no_notifications() {
+    let mut widget = claude();
+    let _ = widget.update(Message::Sessions(vec![
+        live("s", Status::Idle),
+        live("t", Status::Idle),
+    ]));
+    let stop = |session| {
+        Message::Hooks(hooks::Event::Hook(Box::new(hook(
+            session,
+            "Stop",
+            json!({"last_assistant_message": "Done."}),
+        ))))
+    };
+    let front = |widget: &mut Claude, session: Option<&str>| {
+        let n = widget.looked;
+        let _ = widget.update(Message::Front(n, session.map(Into::into)));
+    };
+    // Already up when you switch to its tab: it goes away.
+    let _ = widget.update(stop("s"));
+    assert_eq!(widget.wanted().len(), 1);
+    front(&mut widget, Some("s"));
+    assert!(widget.wanted().is_empty());
+    // Asked while in front: none, but it still waits to be answered.
+    let _answer = ask(&mut widget, 10_140, "s", "Bash", json!({}));
+    assert!(widget.wanted().is_empty());
+    assert_eq!(widget.pending("s").map(|p| p.id), Some(10_140));
+    // Another session still gets its own, and none come back when you look away.
+    let _ = widget.update(stop("t"));
+    front(&mut widget, None);
+    assert_eq!(widget.wanted().len(), 1, "only the other session's");
+    // An answer from an older look comes too late to count.
+    let stale = widget.looked;
+    let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
+    let _ = widget.update(Message::Front(stale, Some("s".into())));
+    assert_eq!(widget.front, None);
+}
+
+#[test]
+fn watching_can_be_turned_off() {
+    let mut widget = Claude::new(toml::from_str("watching = false").unwrap()).0;
+    let _ = widget.update(Message::Sessions(vec![live("s", Status::Idle)]));
+    let n = widget.looked;
+    let _ = widget.update(Message::Front(n, Some("s".into())));
+    let _answer = ask(&mut widget, 10_141, "s", "Bash", json!({}));
+    assert_eq!(widget.wanted().len(), 1);
+}
+
+#[test]
 fn a_chat_follows_only_the_session_showing() {
     let mut widget = claude();
     let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
@@ -680,7 +729,10 @@ fn tools_are_described_briefly() {
 #[test]
 fn config_has_defaults() {
     let config: Config = toml::from_str("timeout = 3").unwrap();
-    assert_eq!((config.done, config.timeout, config.plan), (true, 3, None));
+    assert_eq!(
+        (config.done, config.timeout, config.plan, config.watching),
+        (true, 3, None, true)
+    );
     let config: Config = toml::from_str(r#"plan = "auto""#).unwrap();
     assert_eq!(config.plan.as_deref(), Some("auto"));
     assert!(toml::from_str::<Config>("nope = 1").is_err());
