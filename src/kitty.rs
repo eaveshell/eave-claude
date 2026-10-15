@@ -140,6 +140,7 @@ fn focused_in(data: &str) -> Option<u64> {
     }
     #[derive(Deserialize)]
     struct Tab {
+        is_focused: bool,
         windows: Vec<Window>,
     }
     #[derive(Deserialize)]
@@ -151,6 +152,8 @@ fn focused_in(data: &str) -> Option<u64> {
     windows
         .iter()
         .flat_map(|os| &os.tabs)
+        // Every tab's active pane says it's focused while kitty is: only the active tab's is.
+        .filter(|tab| tab.is_focused)
         .flat_map(|tab| &tab.windows)
         .find(|window| window.is_focused)
         .map(|window| window.id)
@@ -182,9 +185,10 @@ mod tests {
     #[test]
     fn the_focused_pane_is_in_the_reply() {
         let windows = |focused| {
-            json!([{"id": 1, "tabs": [{"windows": [
-                {"id": 7, "is_focused": focused, "title": "claude"},
-            ]}]}])
+            json!([{"id": 1, "tabs": [
+                {"is_focused": false, "windows": [{"id": 3, "is_focused": focused}]},
+                {"is_focused": focused, "windows": [{"id": 7, "is_focused": focused}]},
+            ]}])
             .to_string()
         };
         let data = unframe(&reply(json!({"ok": true, "data": windows(true)}))).unwrap();

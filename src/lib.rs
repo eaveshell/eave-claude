@@ -2248,12 +2248,31 @@ async fn focus(pid: u32, title: Option<String>, pane: Option<kitty::Pane>) -> io
         return Err(io::Error::other("its terminal isn't a window here"));
     };
     let address = &client.address;
-    eave_hyprland::dispatch(
-        &format!("hl.dsp.focus({{ window = \"address:{address}\" }})"),
-        &format!("focuswindow address:{address}"),
-    )
-    .await
+    // Hyprland gives no window the keyboard while a bar surface holds it, as the chat's dialog
+    // does until it has gone: ask again until it took.
+    for _ in 0..FOCUS_TRIES {
+        eave_hyprland::dispatch(
+            &format!("hl.dsp.focus({{ window = \"address:{address}\" }})"),
+            &format!("focuswindow address:{address}"),
+        )
+        .await?;
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct Focused {
+            address: String,
+        }
+        let focused: Focused = eave_hyprland::query("activewindow").await?;
+        if focused.address == *address {
+            return Ok(());
+        }
+        sleep(FOCUS_AGAIN).await;
+    }
+    Err(io::Error::other("Hyprland didn't focus its window"))
 }
+
+/// How often, and how far apart, [`focus`] asks: up to a second, past the dialog going back.
+const FOCUS_TRIES: u32 = 20;
+const FOCUS_AGAIN: Duration = Duration::from_millis(50);
 
 /// A session, as [`front`] needs it.
 struct Terminal {
