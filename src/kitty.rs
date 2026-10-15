@@ -12,6 +12,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
@@ -67,10 +68,27 @@ fn parse(environ: &[u8]) -> Option<Pane> {
 }
 
 /// The pane in front of the kitty on `socket`: the active one of the active tab, while kitty
-/// has the keyboard. `None` when kitty doesn't, or won't say.
+/// has the keyboard. `None` when kitty doesn't.
 pub async fn focused(socket: &Path) -> io::Result<Option<u64>> {
+    let data = command(socket, "ls", json!({"match": "state:focused"})).await?;
+    Ok(focused_in(&data))
+}
+
+/// Brings pane `window` of the kitty on `socket` in front: its tab, its split, its OS window.
+pub async fn focus(socket: &Path, window: u64) -> io::Result<()> {
+    command(
+        socket,
+        "focus-window",
+        json!({"match": format!("id:{window}")}),
+    )
+    .await
+    .map(drop)
+}
+
+/// Sends `cmd` and gives back what kitty answered with, or why it refused.
+async fn command(socket: &Path, cmd: &str, payload: Value) -> io::Result<String> {
     let mut stream = UnixStream::connect(socket).await?;
-    stream.write_all(&request()).await?;
+    stream.write_all(&request(cmd, payload)).await?;
     let mut reply = Vec::new();
     let mut chunk = [0; 8192];
     while !reply.ends_with(END) {
@@ -83,27 +101,39 @@ pub async fn focused(socket: &Path) -> io::Result<Option<u64>> {
         }
         reply.extend_from_slice(&chunk[..read]);
     }
-    Ok(answer(&reply))
+    unframe(&reply)
 }
 
-fn request() -> Vec<u8> {
-    // The oldest version that has it: kitty refuses commands from newer ones than itself.
-    let command = serde_json::json!({
-        "cmd": "ls",
-        "version": [0, 14, 2],
-        "payload": {"match": "state:focused"},
-    });
+fn request(cmd: &str, payload: Value) -> Vec<u8> {
+    // The oldest version that has what we use: kitty refuses commands from newer ones than itself.
+    let command = json!({"cmd": cmd, "version": [0, 14, 2], "payload": payload});
     [START, command.to_string().as_bytes(), END].concat()
 }
 
-/// The focused pane in a reply to [`request`].
-fn answer(reply: &[u8]) -> Option<u64> {
+/// A reply's data, or kitty's error: a password it wants, a pane that's gone.
+fn unframe(reply: &[u8]) -> io::Result<String> {
     #[derive(Deserialize)]
     struct Reply {
         ok: bool,
         #[serde(default)]
-        data: String,
+        data: Option<String>,
+        #[serde(default)]
+        error: String,
     }
+    let invalid = |error| io::Error::new(io::ErrorKind::InvalidData, error);
+    let json = reply
+        .strip_prefix(START)
+        .and_then(|reply| reply.strip_suffix(END))
+        .ok_or_else(|| invalid("not a kitty reply".to_string()))?;
+    let reply: Reply = serde_json::from_slice(json).map_err(|error| invalid(error.to_string()))?;
+    match reply.ok {
+        true => Ok(reply.data.unwrap_or_default()),
+        false => Err(io::Error::other(format!("kitty: {}", reply.error))),
+    }
+}
+
+/// The focused pane in what `ls` answers.
+fn focused_in(data: &str) -> Option<u64> {
     #[derive(Deserialize)]
     struct OsWindow {
         tabs: Vec<Tab>,
@@ -117,12 +147,7 @@ fn answer(reply: &[u8]) -> Option<u64> {
         id: u64,
         is_focused: bool,
     }
-    let json = reply.strip_prefix(START)?.strip_suffix(END)?;
-    let reply: Reply = serde_json::from_slice(json).ok()?;
-    if !reply.ok {
-        return None;
-    }
-    let windows: Vec<OsWindow> = serde_json::from_str(&reply.data).ok()?;
+    let windows: Vec<OsWindow> = serde_json::from_str(data).ok()?;
     windows
         .iter()
         .flat_map(|os| &os.tabs)
@@ -150,32 +175,38 @@ mod tests {
         assert_eq!(parse(b"TERM=foot\0"), None);
     }
 
-    fn reply(ok: bool, data: serde_json::Value) -> Vec<u8> {
-        let body = serde_json::json!({"ok": ok, "data": data.to_string()});
+    fn reply(body: Value) -> Vec<u8> {
         [START, body.to_string().as_bytes(), END].concat()
     }
 
     #[test]
     fn the_focused_pane_is_in_the_reply() {
         let windows = |focused| {
-            serde_json::json!([{"id": 1, "tabs": [{"windows": [
+            json!([{"id": 1, "tabs": [{"windows": [
                 {"id": 7, "is_focused": focused, "title": "claude"},
             ]}]}])
+            .to_string()
         };
-        assert_eq!(answer(&reply(true, windows(true))), Some(7));
-        assert_eq!(
-            answer(&reply(true, windows(false))),
-            None,
-            "kitty isn't focused"
-        );
-        let refused = [START, br#"{"ok":false,"error":"No matching windows"}"#, END].concat();
-        assert_eq!(answer(&refused), None);
-        assert_eq!(answer(b"garbage"), None);
+        let data = unframe(&reply(json!({"ok": true, "data": windows(true)}))).unwrap();
+        assert_eq!(focused_in(&data), Some(7));
+        assert_eq!(focused_in(&windows(false)), None, "kitty isn't focused");
+        // A password, say: kitty says no, and it isn't taken for "none in front".
+        let refused = reply(json!({"ok": false, "error": "Password required"}));
+        assert!(unframe(&refused).is_err());
+        assert!(unframe(b"garbage").is_err());
+        // Focusing answers with no data.
+        assert_eq!(unframe(&reply(json!({"ok": true}))).unwrap(), "");
     }
 
     #[test]
-    fn the_request_is_framed() {
-        let request = request();
-        assert!(request.starts_with(START) && request.ends_with(END));
+    fn requests_are_framed() {
+        let request = request("focus-window", json!({"match": "id:7"}));
+        let json = request
+            .strip_prefix(START)
+            .and_then(|r| r.strip_suffix(END))
+            .unwrap();
+        let command: Value = serde_json::from_slice(json).unwrap();
+        assert_eq!(command["cmd"], "focus-window");
+        assert_eq!(command["payload"]["match"], "id:7");
     }
 }

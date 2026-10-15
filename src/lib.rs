@@ -575,11 +575,12 @@ impl Claude {
                 // The terminal shows the title; it tells its tabs apart.
                 let pid = session.pid;
                 let title = session.title.clone();
+                let pane = session.kitty.clone();
                 self.notes
                     .retain(|note| !(note.session == id && matches!(note.kind, NoteKind::Done(_))));
                 Effect::task(
                     Task::future(async move {
-                        if let Err(error) = focus(pid, title).await {
+                        if let Err(error) = focus(pid, title, pane).await {
                             eprintln!("eave-claude: can't show the session: {error}");
                         }
                     })
@@ -1391,6 +1392,10 @@ impl Claude {
                 "deny" => self.handle(Message::Deny(id)),
                 "approve" => self.approve(id),
                 "default" | "answer" => self.show(Page::Prompt(id)),
+                "show" => match self.prompt(id).map(|prompt| prompt.session.clone()) {
+                    Some(session) => self.handle(Message::Focus(session)),
+                    None => Effect::none(),
+                },
                 notify::BACK => match self.asking(id) {
                     Some(at) if at > 0 => self.handle(Message::Turn(id, at - 1)),
                     _ => Effect::none(),
@@ -1468,6 +1473,7 @@ impl Claude {
 
     fn prompt_note(&self, prompt: &Prompt) -> notify::Note {
         let label = self.label(&prompt.session, &prompt.cwd);
+        let show = ("show".to_string(), "Show".to_string());
         let open = ("default".to_string(), "Open".to_string());
         let mut question = None;
         let (summary, body, mut actions, reply) = match &prompt.ask {
@@ -1536,7 +1542,7 @@ impl Claude {
                 }
             }
         };
-        actions.push(open);
+        actions.extend([show, open]);
         notify::Note {
             app: label,
             thread: prompt.session.clone(),
@@ -1554,7 +1560,10 @@ impl Claude {
     fn note_note(&self, note: &Note) -> notify::Note {
         let session = self.session(&note.session);
         let label = session.map_or_else(|| "Claude".into(), Session::label);
-        let mut actions = vec![("default".to_string(), "Open".to_string())];
+        let actions = vec![
+            ("show".to_string(), "Show".to_string()),
+            ("default".to_string(), "Open".to_string()),
+        ];
         let (summary, body, reply, seconds) = match &note.kind {
             NoteKind::Done(reply) => {
                 let answerable = session.is_some_and(|s| s.socket.is_some());
@@ -1568,15 +1577,12 @@ impl Claude {
                 )
             }
             NoteKind::Failed(error) => ("Stopped with an error".into(), error.clone(), None, None),
-            NoteKind::Waiting(what) => {
-                actions.insert(0, ("show".into(), "Show".into()));
-                (
-                    "Waiting for you in the terminal".into(),
-                    what.clone(),
-                    None,
-                    None,
-                )
-            }
+            NoteKind::Waiting(what) => (
+                "Waiting for you in the terminal".into(),
+                what.clone(),
+                None,
+                None,
+            ),
         };
         // A turn that failed waits for you: it's news that can't wait.
         let urgency = if matches!(note.kind, NoteKind::Failed(_)) {
@@ -2216,7 +2222,15 @@ pub(crate) fn shorten(text: &str, max: usize) -> String {
 
 /// Focuses the window of the terminal session `pid` runs in. A terminal that runs every window
 /// in one process (kitty, foot's server) has several: the one showing the session's title wins.
-async fn focus(pid: u32, title: Option<String>) -> io::Result<()> {
+/// kitty, when it takes remote control, first switches to the session's tab and split, which
+/// gives that window the session's title.
+async fn focus(pid: u32, title: Option<String>, pane: Option<kitty::Pane>) -> io::Result<()> {
+    if let Some(pane) = pane
+        && let Some(socket) = pane.socket
+        && let Err(error) = kitty::focus(&socket, pane.window).await
+    {
+        eprintln!("eave-claude: can't switch kitty to the session's tab: {error}");
+    }
     #[derive(Deserialize)]
     struct Client {
         address: String,

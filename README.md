@@ -54,7 +54,8 @@ when one waits for you in the terminal, but can't answer for it.
   line, each marked done, under way, failed or waiting for you. Markdown and all, with code
   colored, the tools it runs with what came of them, the edits it makes as diffs, what it asks
   you, and a field to message it. Show focuses its terminal, and Esc closes it. Clicking a
-  notification opens its session's chat, which the notification turns into.
+  notification opens its session's chat, which the notification turns into, and its Show
+  button goes to its terminal instead.
 - **In the dormer:** allow or deny what a session asks, approve a plan, open a question to
   answer it, and open any session's chat, which the dormer turns into, or show its terminal.
 
@@ -62,8 +63,8 @@ While a session's chat is open, it sends no notifications for that session: you'
 reading it already, and what it asks is answered right there. The same goes while its terminal is
 in front of you, on its tab: a notification already up goes away when you switch to it, and the
 prompt still waits in the popover. Most terminals are told apart by the window's title, which
-Claude Code sets to the session's. kitty can say exactly which tab and split you're on, with
-remote control on in `kitty.conf`:
+Claude Code sets to the session's. kitty can say exactly which tab and split you're on, and Show
+switches to the session's, with remote control on in `kitty.conf`:
 
 ```
 allow_remote_control socket-only
