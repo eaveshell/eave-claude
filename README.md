@@ -86,8 +86,9 @@ only once you click it.
 
 ## Keys
 
-While the popover is open, `1` to `9` and `0` open the first ten sessions' chats. They're named
-`chat-1` to `chat-10`, so you can give them other keys, or none, in the widget's entry:
+While the popover is open, `1` to `9` and `0` open the first ten sessions' chats, and in a chat
+`Ctrl+T` shows its terminal (with an eave newer than eave-api 0.1.8). They're named `chat-1` to
+`chat-10` and `show`, so you can give them other keys, or none, in the widget's entry:
 
 ```toml
 [[right]]

@@ -1739,10 +1739,10 @@ impl Claude {
         let header = ui::header(session.label())
             .leading(mascot)
             .subtitle(home(&session.cwd))
-            .trailing(ui::button(
-                ui::label("Show"),
-                Message::Focus(session.id.clone()),
-            ));
+            .trailing(
+                ui::button(ui::label("Show"), Message::Focus(session.id.clone()))
+                    .shortcut("show", ui::shortcut('t').ctrl()),
+            );
         let chat = self
             .chat
             .as_ref()
