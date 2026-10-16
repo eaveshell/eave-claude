@@ -11,7 +11,7 @@ repository = "https://github.com/eaveshell/eave-claude"
 [dependencies]
 # From crates.io. When eave-build compiles the plugin into a bar, it patches these to the eave it
 # builds, so the host and the plugin share one.
-eave-api = "0.1.8"
+eave-api = "0.1.9"
 # The local hour, for the mascot to sleep at night. Already in the build through eave's clock.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # Notifications go over the session bus (eave's D-52), on the bar's shared connection. zbus is

@@ -17,6 +17,7 @@ fn live(id: &str, status: Status) -> sessions::Live {
         title: Some("Bar plugin".into()),
         status,
         socket: Some(PathBuf::from("/run/user/1/cc-socks/4242.sock")),
+        kitty: None,
         started: 1,
         since: 1,
     }
@@ -97,7 +98,7 @@ fn a_permission_prompt_is_a_notice_that_answers() {
     assert_eq!(shown[0].app, "Bar plugin");
     assert_eq!(
         labels(&shown[0]),
-        ["Allow", "Always allow", "Deny", "Open"],
+        ["Allow", "Always allow", "Deny", "Show", "Open"],
         "always, as the terminal suggested rules"
     );
     assert_eq!(
@@ -169,7 +170,7 @@ fn a_short_question_answers_from_the_notice() {
     let mut answer = ask(&mut widget, 10_005, "s", "AskUserQuestion", input.clone());
     let shown = notices(&widget);
     assert_eq!(shown[0].summary, "Fruit");
-    assert_eq!(labels(&shown[0]), ["Apple", "Pear", "Open"]);
+    assert_eq!(labels(&shown[0]), ["Apple", "Pear", "Show", "Open"]);
     assert_eq!(shown[0].reply.as_deref(), Some("Your answer"));
     posted(&mut widget, Key::Prompt(10_005), 9);
     let _ = signal(&mut widget, notify::Signal::Action(9, "pick:1".into()));
@@ -212,7 +213,7 @@ fn several_questions_wait_for_send() {
     assert_eq!(shown[0].summary, "2 questions");
     assert_eq!(
         labels(&shown[0]),
-        ["Answer…", "Open"],
+        ["Answer…", "Show", "Open"],
         "the popover asks them"
     );
     assert_eq!(shown[0].reply, None);
@@ -246,7 +247,7 @@ fn a_plan_is_approved_or_sent_back() {
         (shown[0].summary.as_str(), shown[0].body.as_str()),
         ("Plan ready", "# Plan\n1. do it")
     );
-    assert_eq!(labels(&shown[0]), ["Approve", "Open"]);
+    assert_eq!(labels(&shown[0]), ["Approve", "Show", "Open"]);
     assert_eq!(shown[0].reply.as_deref(), Some("What should change?"));
     let _ = widget.update(Message::Draft(
         Target::Prompt(10_008),
@@ -433,7 +434,7 @@ fn a_finished_turn_says_so_and_takes_a_reply() {
         "its first line says it"
     );
     assert_eq!(shown[0].body, "");
-    assert_eq!(labels(&shown[0]), ["Open"]);
+    assert_eq!(labels(&shown[0]), ["Show", "Open"]);
     assert_eq!(shown[0].reply.as_deref(), Some("Message Claude"));
     assert_eq!(shown[0].seconds, Some(8));
     assert_eq!(
@@ -543,6 +544,54 @@ fn a_chat_that_shows_needs_no_notifications() {
     assert_eq!(widget.wanted().len(), 1);
     let _ = widget.update(Message::DialogClosed);
     assert_eq!(widget.wanted().len(), 1, "only the other session's");
+}
+
+#[test]
+fn a_terminal_in_front_needs_no_notifications() {
+    let mut widget = claude();
+    let _ = widget.update(Message::Sessions(vec![
+        live("s", Status::Idle),
+        live("t", Status::Idle),
+    ]));
+    let stop = |session| {
+        Message::Hooks(hooks::Event::Hook(Box::new(hook(
+            session,
+            "Stop",
+            json!({"last_assistant_message": "Done."}),
+        ))))
+    };
+    let front = |widget: &mut Claude, session: Option<&str>| {
+        let n = widget.looked;
+        let _ = widget.update(Message::Front(n, session.map(Into::into)));
+    };
+    // Already up when you switch to its tab: it goes away.
+    let _ = widget.update(stop("s"));
+    assert_eq!(widget.wanted().len(), 1);
+    front(&mut widget, Some("s"));
+    assert!(widget.wanted().is_empty());
+    // Asked while in front: none, but it still waits to be answered.
+    let _answer = ask(&mut widget, 10_140, "s", "Bash", json!({}));
+    assert!(widget.wanted().is_empty());
+    assert_eq!(widget.pending("s").map(|p| p.id), Some(10_140));
+    // Another session still gets its own, and none come back when you look away.
+    let _ = widget.update(stop("t"));
+    front(&mut widget, None);
+    assert_eq!(widget.wanted().len(), 1, "only the other session's");
+    // An answer from an older look comes too late to count.
+    let stale = widget.looked;
+    let _ = widget.update(Message::Sessions(vec![live("s", Status::Busy)]));
+    let _ = widget.update(Message::Front(stale, Some("s".into())));
+    assert_eq!(widget.front, None);
+}
+
+#[test]
+fn watching_can_be_turned_off() {
+    let mut widget = Claude::new(toml::from_str("watching = false").unwrap()).0;
+    let _ = widget.update(Message::Sessions(vec![live("s", Status::Idle)]));
+    let n = widget.looked;
+    let _ = widget.update(Message::Front(n, Some("s".into())));
+    let _answer = ask(&mut widget, 10_141, "s", "Bash", json!({}));
+    assert_eq!(widget.wanted().len(), 1);
 }
 
 #[test]
@@ -680,7 +729,10 @@ fn tools_are_described_briefly() {
 #[test]
 fn config_has_defaults() {
     let config: Config = toml::from_str("timeout = 3").unwrap();
-    assert_eq!((config.done, config.timeout, config.plan), (true, 3, None));
+    assert_eq!(
+        (config.done, config.timeout, config.plan, config.watching),
+        (true, 3, None, true)
+    );
     let config: Config = toml::from_str(r#"plan = "auto""#).unwrap();
     assert_eq!(config.plan.as_deref(), Some("auto"));
     assert!(toml::from_str::<Config>("nope = 1").is_err());
@@ -825,6 +877,24 @@ fn always_allow_from_the_notification_sends_the_suggested_rules() {
 }
 
 #[test]
+fn show_on_a_prompt_s_notification_leaves_it_to_answer() {
+    let mut widget = claude();
+    let _ = widget.update(Message::Sessions(vec![live("s", Status::Idle)]));
+    let _ = widget.update(Message::Hooks(hooks::Event::Hook(Box::new(hook(
+        "s",
+        "Stop",
+        json!({"last_assistant_message": "Done."}),
+    )))));
+    let mut answer = ask(&mut widget, 10_142, "s", "Bash", json!({"command": "ls"}));
+    posted(&mut widget, Key::Prompt(10_142), 12);
+    let _ = signal(&mut widget, notify::Signal::Action(12, "show".into()));
+    assert!(answer.try_recv().is_err(), "not answered");
+    assert_eq!(widget.pending("s").map(|p| p.id), Some(10_142));
+    // Its notification closes, as on any action, and its turn's news is old once you're there.
+    assert!(widget.wanted().is_empty());
+}
+
+#[test]
 fn a_failed_turn_is_critical() {
     let mut widget = claude();
     let _ = widget.update(Message::Sessions(vec![live("s", Status::Idle)]));
@@ -852,12 +922,20 @@ fn eave_gets_a_question_s_options_and_a_way_back() {
     ]});
     let _answer = ask(&mut widget, 10_130, "s", "AskUserQuestion", input);
     let plain = notices(&widget).remove(0);
-    assert_eq!(labels(&plain), ["Answer…", "Open"], "others get the chat");
+    assert_eq!(
+        labels(&plain),
+        ["Answer…", "Show", "Open"],
+        "others get the chat"
+    );
 
     let rich = notify::rich(plain.clone(), EAVE);
     assert_eq!(rich.summary, "Which renderer?");
     assert_eq!(rich.body, "");
-    assert_eq!(labels(&rich), ["Open"], "the options are the question's");
+    assert_eq!(
+        labels(&rich),
+        ["Show", "Open"],
+        "the options are the question's"
+    );
     assert_eq!(rich.reply.as_deref(), Some("Or answer in your own words"));
     let question = rich.question.as_ref().expect("asked");
     assert_eq!(question.step, (0, 2));
@@ -871,7 +949,7 @@ fn eave_gets_a_question_s_options_and_a_way_back() {
     let step = widget.posted[0].note.question.as_ref().map(|q| q.step);
     assert_eq!(step, Some((1, 2)), "sent again for the next question");
     let rich = notify::rich(widget.posted[0].note.clone(), EAVE);
-    assert_eq!(labels(&rich), ["Open", "Back"]);
+    assert_eq!(labels(&rich), ["Show", "Open", "Back"]);
 
     // Back, then on again.
     let _ = signal(&mut widget, notify::Signal::Action(11, notify::BACK.into()));

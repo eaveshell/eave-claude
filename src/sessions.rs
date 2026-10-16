@@ -17,7 +17,7 @@ use rustix::io::Errno;
 use serde::Deserialize;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use crate::title;
+use crate::{kitty, title};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Status {
@@ -43,6 +43,8 @@ pub struct Live {
     pub status: Status,
     /// Where it takes messages from other sessions, if it speaks a protocol we know.
     pub socket: Option<PathBuf>,
+    /// The kitty pane it runs in, if it does.
+    pub kitty: Option<kitty::Pane>,
     /// Milliseconds since the epoch.
     pub started: u64,
     /// When its status last changed, in milliseconds since the epoch.
@@ -177,7 +179,8 @@ fn scan(config: &Path) -> Vec<Live> {
         .map(|file| {
             let transcript = transcript(config, &file.cwd, &file.session_id);
             let title = title::last(&transcript);
-            file.into_live(title)
+            let kitty = kitty::pane(file.pid);
+            file.into_live(title, kitty)
         })
         .collect();
     sessions.sort_by_key(|session| std::cmp::Reverse(session.started));
@@ -208,7 +211,7 @@ fn parse(json: &str) -> Option<File> {
 }
 
 impl File {
-    fn into_live(self, title: Option<String>) -> Live {
+    fn into_live(self, title: Option<String>, kitty: Option<kitty::Pane>) -> Live {
         let status = match self.status.as_deref() {
             Some("busy") => Status::Busy,
             Some("shell") => Status::Shell,
@@ -227,6 +230,7 @@ impl File {
             title,
             status,
             socket,
+            kitty,
             started: self.started_at,
             since: self.status_updated_at.unwrap_or(self.started_at),
         }
@@ -286,7 +290,7 @@ mod tests {
             "procStart":"3391076","version":"2.1.293","peerProtocol":1,"kind":"interactive",
             "messagingSocketPath":"/run/user/1001/cc-socks/673122.sock","name":"eave-01",
             "status":"waiting","waitingFor":"permission prompt","somethingNew":true}"#;
-        let live = parse(json).unwrap().into_live(Some("Title".into()));
+        let live = parse(json).unwrap().into_live(Some("Title".into()), None);
         assert_eq!(live.pid, 673122);
         assert_eq!(live.name.as_deref(), Some("eave-01"));
         assert_eq!(live.status, Status::Waiting("permission prompt".into()));
@@ -299,7 +303,7 @@ mod tests {
     #[test]
     fn unknown_protocols_and_statuses_are_safe() {
         let json = r#"{"pid":1,"sessionId":"a","status":"pondering","messagingSocketPath":"/s"}"#;
-        let live = parse(json).unwrap().into_live(None);
+        let live = parse(json).unwrap().into_live(None, None);
         assert_eq!(live.status, Status::Idle);
         assert_eq!(
             live.socket, None,
