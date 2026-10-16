@@ -32,8 +32,8 @@ when one waits for you in the terminal, but can't answer for it.
   | planning | working in plan mode |
   | laptop | working |
   | happy | finished its turn, in the last five minutes |
-  | coffee | idle a while, by day (dimmed) |
-  | sleeping | idle a while, between 22:00 and 07:00 (dimmed) |
+  | coffee | idle a while, by day |
+  | sleeping | idle a while, between 22:00 and 07:00 |
 - **Permission prompts:** Allow, Always allow (the terminal's "don't ask again"), Deny (Claude
   stops, like Esc in the terminal), or type into the field what Claude should do instead. A
   command that says what it's for asks that: "Run the workspace tests?".

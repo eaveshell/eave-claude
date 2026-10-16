@@ -59,11 +59,6 @@ impl Mood {
             Mood::Question => "question",
         }
     }
-
-    /// Nothing going on: dimmed in the bar.
-    pub fn resting(self) -> bool {
-        self <= Mood::Coffee
-    }
 }
 
 /// What the plugin knows about a session, for its mood.

@@ -827,12 +827,12 @@ fn the_mascot_works_plans_asks_and_rests() {
     // Not after a turn that failed.
     let failed = hook("s", "StopFailure", json!({"error": "overloaded"}));
     let _ = widget.update(Message::Hooks(hooks::Event::Hook(Box::new(failed))));
-    assert!(widget.mood().resting());
+    assert!(widget.mood() <= Mood::Coffee);
 
     // Long idle: coffee or sleep, whichever the hour says.
     done.since = 1;
     let _ = widget.update(Message::Sessions(vec![done]));
-    assert!(widget.mood().resting());
+    assert!(widget.mood() <= Mood::Coffee);
     assert!(widget.next_change().is_some_and(|at| at > now));
 }
 
