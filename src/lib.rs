@@ -360,15 +360,14 @@ impl Widget for Claude {
         let waiting = self.waiting();
         // The mascot, in the mood of the session that most needs saying. It acts out a change of
         // mood, then rests: sessions work most of the day, and a mascot that keeps moving keeps
-        // the bar drawing. Only a question goes on, until it's answered. Dimmed while nothing
-        // works, waits or just finished.
+        // the bar drawing. Only a question goes on, until it's answered.
         let mood = self.mood();
         let sprite = mood.sprite();
         let logo = ui::sprite(sprite.frames, sprite.order);
-        let logo = match mood {
-            Mood::Question => logo.looping(),
-            mood if mood.resting() => logo.tone(Tone::Dim),
-            _ => logo,
+        let logo = if mood == Mood::Question {
+            logo.looping()
+        } else {
+            logo
         };
         let content = match waiting {
             0 => logo,
